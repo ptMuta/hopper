@@ -8,6 +8,7 @@ pub mod api;
 pub mod apply;
 pub mod cache;
 pub mod fs;
+pub mod java;
 pub mod model;
 pub mod net;
 pub mod plan;

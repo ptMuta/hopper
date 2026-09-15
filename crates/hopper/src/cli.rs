@@ -148,6 +148,13 @@ pub struct InstallArgs {
     #[arg(long)]
     pub no_optional: bool,
 
+    /// Install only the pack's mods and configs
+    ///
+    /// Skips the mod loader, the server jar and Java entirely. For a directory that
+    /// already has a working server, or one managed by something else.
+    #[arg(long)]
+    pub mods_only: bool,
+
     /// Install a file even if hopper classified it as client-only
     #[arg(long, value_name = "NAME")]
     pub force_include: Vec<String>,
@@ -285,6 +292,16 @@ mod tests {
             panic!("expected disable");
         };
         assert_eq!(name, "sodium");
+    }
+
+    #[test]
+    fn mods_only_is_off_by_default() {
+        assert!(!Cli::parse_from(["hopper", "x"]).install.mods_only);
+        assert!(
+            Cli::parse_from(["hopper", "x", "--mods-only"])
+                .install
+                .mods_only
+        );
     }
 
     #[test]

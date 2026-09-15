@@ -22,6 +22,7 @@ use hopper_core::source::{SourceSpec, spec::SpecError};
 
 mod cli;
 mod render;
+mod runtime;
 
 use cli::{Cli, Command, exit};
 
@@ -314,8 +315,29 @@ async fn install(cli: &Cli) -> Result<i32> {
         println!();
     }
 
-    // 3. Plan against what is on disk.
-    let mut interesting: Vec<RelPath> = resolved.desired.paths().cloned().collect();
+    // 3. Resolve the runtime: the vanilla jar and the loader's libraries. These become
+    //    ordinary managed files, so a loader upgrade cleans up its own stale libraries/ tree
+    //    through the same path that removes a dropped mod.
+    //
+    //    --mods-only skips all of it, for a directory that already has a working server.
+    // Remembered across runs: someone who installed with --mods-only must not get a loader
+    // and a JVM appear underneath them on the next bare `hopper`.
+    let mods_only = cli.install.mods_only || existing.as_ref().is_some_and(|l| l.policy.mods_only);
+    let runtime = if mods_only {
+        None
+    } else {
+        Some(resolve_runtime(cli, &pack, &store).await?)
+    };
+
+    let mut desired = resolved.desired.clone();
+    if let Some((rt, _)) = &runtime {
+        for f in &rt.files {
+            desired.insert(f.clone());
+        }
+    }
+
+    // 4. Plan against what is on disk.
+    let mut interesting: Vec<RelPath> = desired.paths().cloned().collect();
     if let Some(l) = &existing {
         interesting.extend(l.files.iter().map(|f| f.path.clone()));
     }
@@ -323,7 +345,7 @@ async fn install(cli: &Cli) -> Result<i32> {
     let decisions = reconcile(
         existing.as_ref(),
         &disk,
-        &resolved.desired,
+        &desired,
         &ConflictPolicy::default(),
     );
     let summary = Summary::of(&decisions);
@@ -366,7 +388,7 @@ async fn install(cli: &Cli) -> Result<i32> {
     //    were already staged out of the archive. Both must end up in the lockfile -- an
     //    installed file that is not recorded can never be updated or cleaned up afterwards.
     let mut entries: BTreeMap<RelPath, LockedFile> = BTreeMap::new();
-    for (path, file) in resolved.desired.iter() {
+    for (path, file) in desired.iter() {
         let (digest, size) = match pack.index.files.iter().find(|f| f.path == *path) {
             Some(index_file) => {
                 let urls: Vec<String> = index_file
@@ -380,7 +402,7 @@ async fn install(cli: &Cli) -> Result<i32> {
                     .with_context(|| format!("downloading {path}"))?;
                 (blob.digest, blob.size)
             }
-            // An override: already in the store from stage_overrides.
+            // An override or a runtime file: already staged into the store.
             None => (file.content.clone(), file.size.unwrap_or(0)),
         };
 
@@ -402,7 +424,13 @@ async fn install(cli: &Cli) -> Result<i32> {
     }
 
     // 6. Apply.
-    let template = lockfile_template(&pack, &source_arg, existing.as_ref());
+    let mut template = lockfile_template(&pack, &source_arg, existing.as_ref());
+    template.policy.mods_only = mods_only;
+    template.policy.include_optional = !cli.install.no_optional;
+    if let Some((rt, _)) = &runtime {
+        template.server.loader_version = rt.loader_version.clone();
+        template.server.java_major = rt.java_major;
+    }
     let next = next_lockfile(existing.as_ref(), &decisions, &entries, template);
     let txn = format!("{}", std::process::id());
     let applied = apply(
@@ -416,7 +444,11 @@ async fn install(cli: &Cli) -> Result<i32> {
     )
     .context("applying the plan")?;
 
-    // 7. Bootstrap.
+    // 7. Bootstrap: one start command regardless of loader.
+    if let Some((rt, java)) = &runtime {
+        write_start_script(root, rt, java)?;
+    }
+
     let props = root.join("server.properties");
     if !props.exists() {
         hfs::write_atomic(
@@ -443,6 +475,11 @@ async fn install(cli: &Cli) -> Result<i32> {
             }
         }
         println!("\n{} is installed.", pack.index.name);
+        if runtime.is_some() {
+            println!("\n  Start it:      ./start.sh");
+        }
+        println!("  Update later:  hopper");
+        println!("  What's here:   hopper status");
         if !eula_accepted(root) {
             println!("\n  note: the Minecraft EULA has not been accepted, so the server");
             println!("        will not start. Accept it with:  hopper --eula");
@@ -555,6 +592,145 @@ fn count_user_files(root: &Path, lock: &Option<Lockfile>) -> usize {
             lock.as_ref().is_none_or(|l| l.file(&path).is_none())
         })
         .count()
+}
+
+/// Resolve the server jar, the loader and a JVM.
+async fn resolve_runtime(
+    cli: &Cli,
+    pack: &Mrpack,
+    store: &BlobStore,
+) -> Result<(runtime::Runtime, hopper_core::java::JavaPlan)> {
+    let client = HttpClient::new(&user_agent(), HostAllowlist::runtimes())
+        .context("building the runtime HTTP client")?;
+    let release = runtime::resolve_minecraft(&client, &pack.index.minecraft).await?;
+
+    let java = runtime::plan_runtime_java(
+        release.java_major,
+        &pack.index.minecraft,
+        cli.install.java.as_deref(),
+        Some(cli.install.java_vendor.into()),
+    )?;
+    describe_java(&java, release.java_major, cli.global.quiet);
+
+    // Provision before anything is written to the server directory, so a failure here leaves
+    // it untouched.
+    let java = match java {
+        hopper_core::java::JavaPlan::Provision { candidate } => {
+            let data = runtime::data_dir()?;
+            let installed = runtime::provision_java(&client, store, &candidate, &data).await?;
+            if !cli.global.quiet {
+                println!("      installed to {}", installed.path.display());
+            }
+            hopper_core::java::JavaPlan::UseExisting { java: installed }
+        }
+        other => other,
+    };
+
+    let rt = runtime::resolve_loader(
+        &client,
+        store,
+        pack.index.loader,
+        pack.index.loader_version.as_deref(),
+        &pack.index.minecraft,
+        &release,
+    )
+    .await?;
+    Ok((rt, java))
+}
+
+/// Say what will happen about Java before anything is downloaded.
+///
+/// A surprise JDK download after someone typed "yes" to installing a modpack is the kind of
+/// thing that makes a tool feel untrustworthy.
+fn describe_java(plan: &hopper_core::java::JavaPlan, major: u32, quiet: bool) {
+    if quiet {
+        return;
+    }
+    match plan {
+        hopper_core::java::JavaPlan::UseExisting { java } => {
+            println!(
+                "Java: using {} ({} {})",
+                java.path.display(),
+                java.vendor,
+                java.version
+            );
+        }
+        hopper_core::java::JavaPlan::Provision { candidate } => {
+            println!(
+                "Java: no suitable JVM found; this pack needs Java {major}.\n      \
+                 hopper would install {} {}.",
+                candidate.vendor, candidate.major
+            );
+        }
+        hopper_core::java::JavaPlan::Unavailable { major, platform } => {
+            println!(
+                "Java: no Java {major} build is published for {:?} {:?}.",
+                platform.os, platform.arch
+            );
+        }
+    }
+}
+
+/// Emit `start.sh` and, on first install, `jvm.args`.
+fn write_start_script(
+    root: &Path,
+    runtime: &runtime::Runtime,
+    java: &hopper_core::java::JavaPlan,
+) -> Result<()> {
+    use hopper_core::java::JavaPlan;
+    use hopper_core::server::{JavaLocation, jvm_args_file, start_script, suggested_heap_gb};
+
+    let location = match java {
+        JavaPlan::UseExisting { java } => JavaLocation::System {
+            path: java.path.display().to_string(),
+        },
+        // Nothing has been provisioned yet, so fall back to whatever `java` the environment
+        // provides; JAVA= in the script lets the operator point at a specific one.
+        _ => JavaLocation::System {
+            path: "java".into(),
+        },
+    };
+
+    let args_path = RelPath::parse("jvm.args").expect("a constant path");
+    let jvm_args = root.join("jvm.args");
+    if !jvm_args.exists() {
+        // Seeded once, then the operator's file.
+        let total_gb = total_memory_gb();
+        hfs::write_atomic(
+            &jvm_args,
+            jvm_args_file(suggested_heap_gb(total_gb), Some(total_gb)).as_bytes(),
+            false,
+        )
+        .context("writing jvm.args")?;
+    }
+
+    hfs::write_atomic(
+        &root.join("start.sh"),
+        start_script(
+            &runtime.launch,
+            &location,
+            Some(&args_path),
+            env!("CARGO_PKG_VERSION"),
+        )
+        .as_bytes(),
+        true,
+    )
+    .context("writing start.sh")?;
+    Ok(())
+}
+
+/// Total system memory in gigabytes, for the default heap size.
+fn total_memory_gb() -> u64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("MemTotal:"))
+                .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+        })
+        .map(|kb| kb / 1024 / 1024)
+        // A conservative default beats guessing high on an unknown platform.
+        .unwrap_or(4)
 }
 
 fn accept_eula(root: &Path) -> Result<()> {

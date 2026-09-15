@@ -24,6 +24,8 @@ async-trait = "0.1"
 quick-xml = "0.37"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+tar = "0.4"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 futures = "0.3"
 
 [profile.release]

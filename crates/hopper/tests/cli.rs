@@ -30,6 +30,14 @@ impl Server {
         self.dir.path().join("cache")
     }
 
+    /// Install a pack. Always `--mods-only`, so the suite never touches the network: the
+    /// loader, server jar and JVM all come from remote metadata.
+    fn install(&self, pack: &Path, extra: &[&str]) -> (String, String, i32) {
+        let mut args = vec![pack.to_str().unwrap(), "--mods-only"];
+        args.extend_from_slice(extra);
+        self.run(&args)
+    }
+
     fn run(&self, args: &[&str]) -> (String, String, i32) {
         let out = Command::new(BIN)
             .args(args)
@@ -98,7 +106,7 @@ fn installs_a_pack_and_records_every_file_it_wrote() {
         ],
     );
 
-    let (out, err, code) = s.run(&[pack.to_str().unwrap(), "--yes", "--eula"]);
+    let (out, err, code) = s.install(&pack, &["--yes", "--eula"]);
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
     assert!(s.exists("config/a.toml"));
     assert!(s.exists("config/server.toml"));
@@ -127,7 +135,7 @@ fn client_only_content_never_reaches_the_server() {
         ],
     );
 
-    let (out, err, code) = s.run(&[pack.to_str().unwrap(), "--yes"]);
+    let (out, err, code) = s.install(&pack, &["--yes"]);
     assert_eq!(code, 0, "{out}{err}");
     assert!(s.exists("config/a.toml"));
     assert!(!s.exists("options.txt"), "client-overrides must be dropped");
@@ -147,7 +155,7 @@ fn an_update_preserves_operator_work_and_removes_what_the_pack_dropped() {
             ("overrides/config/gone.toml", "bye\n"),
         ],
     );
-    s.run(&[v1.to_str().unwrap(), "--yes", "--eula"]);
+    s.install(&v1, &["--yes", "--eula"]);
 
     // The operator adds a mod and tunes a config.
     s.write("mods/my-plugin.jar", "mine");
@@ -159,7 +167,7 @@ fn an_update_preserves_operator_work_and_removes_what_the_pack_dropped() {
         "2.0.0",
         &[("overrides/config/a.toml", "setting=NEW\n")],
     );
-    let (out, err, code) = s.run(&[v2.to_str().unwrap(), "--yes"]);
+    let (out, err, code) = s.install(&v2, &["--yes"]);
     assert_eq!(code, 0, "{out}{err}");
 
     assert_eq!(s.read("mods/my-plugin.jar").as_deref(), Some("mine"));
@@ -189,8 +197,8 @@ fn a_second_identical_run_does_nothing() {
     let pack = s.dir.path().join("v1.mrpack");
     build_pack(&pack, "1.0.0", &[("overrides/config/a.toml", "x=1\n")]);
 
-    s.run(&[pack.to_str().unwrap(), "--yes", "--eula"]);
-    let (out, _, code) = s.run(&[pack.to_str().unwrap(), "--yes"]);
+    s.install(&pack, &["--yes", "--eula"]);
+    let (out, _, code) = s.install(&pack, &["--yes"]);
     assert_eq!(code, 0);
     assert!(out.contains("Already up to date"), "got:\n{out}");
 }
@@ -201,7 +209,7 @@ fn dry_run_reports_pending_changes_without_applying_them() {
     let pack = s.dir.path().join("v1.mrpack");
     build_pack(&pack, "1.0.0", &[("overrides/config/a.toml", "x=1\n")]);
 
-    let (out, _, code) = s.run(&[pack.to_str().unwrap(), "-n"]);
+    let (out, _, code) = s.install(&pack, &["-n"]);
     assert_eq!(
         code, 10,
         "pending changes exit 10 so cron can branch:\n{out}"
@@ -209,8 +217,8 @@ fn dry_run_reports_pending_changes_without_applying_them() {
     assert!(!s.exists("config/a.toml"), "--dry-run must not write");
 
     // And nothing at all once it is settled.
-    s.run(&[pack.to_str().unwrap(), "--yes"]);
-    let (_, _, code) = s.run(&[pack.to_str().unwrap(), "-n"]);
+    s.install(&pack, &["--yes"]);
+    let (_, _, code) = s.install(&pack, &["-n"]);
     assert_eq!(code, 0, "a settled directory exits 0");
 }
 
@@ -219,9 +227,10 @@ fn a_bare_invocation_replays_the_recorded_source() {
     let s = Server::new();
     let pack = s.dir.path().join("v1.mrpack");
     build_pack(&pack, "1.0.0", &[("overrides/config/a.toml", "x=1\n")]);
-    s.run(&[pack.to_str().unwrap(), "--yes", "--eula"]);
+    s.install(&pack, &["--yes", "--eula"]);
 
-    // No pack argument: it should remember what this directory was installed from.
+    // No pack argument: it should remember what this directory was installed from, and
+    // that it was a mods-only install -- otherwise a loader and a JVM would appear.
     let (out, err, code) = s.run(&["--yes"]);
     assert_eq!(code, 0, "{out}{err}");
     assert!(out.contains("Already up to date"), "got:\n{out}{err}");
@@ -243,14 +252,14 @@ fn yes_does_not_accept_the_eula() {
     let pack = s.dir.path().join("v1.mrpack");
     build_pack(&pack, "1.0.0", &[("overrides/config/a.toml", "x=1\n")]);
 
-    let (out, _, _) = s.run(&[pack.to_str().unwrap(), "--yes"]);
+    let (out, _, _) = s.install(&pack, &["--yes"]);
     assert!(
         !s.exists("eula.txt"),
         "--yes must not write eula.txt:\n{out}"
     );
     assert!(out.contains("EULA has not been accepted"), "got:\n{out}");
 
-    let (_, _, _) = s.run(&[pack.to_str().unwrap(), "--yes", "--eula"]);
+    let (_, _, _) = s.install(&pack, &["--yes", "--eula"]);
     assert!(s.read("eula.txt").unwrap().contains("eula=true"));
 }
 
@@ -283,7 +292,7 @@ fn a_hostile_pack_is_refused_with_a_security_exit_code() {
         &[("overrides/../../../../tmp/hopper-pwned", "payload\n")],
     );
 
-    let (_, err, code) = s.run(&[pack.to_str().unwrap(), "--yes"]);
+    let (_, err, code) = s.install(&pack, &["--yes"]);
     assert_eq!(code, 5, "security refusals get their own exit code:\n{err}");
     assert!(!Path::new("/tmp/hopper-pwned").exists());
 }

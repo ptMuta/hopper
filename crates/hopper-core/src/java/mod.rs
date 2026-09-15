@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub mod install;
 pub mod probe;
 
 pub use probe::{ProbeError, SystemJava, parse_probe_output};
@@ -546,5 +547,168 @@ mod tests {
         let s = dir.to_string_lossy();
         assert!(s.contains("toolchains/graalvm-21-linux-x64"), "got {s}");
         assert!(!s.contains(".cache"));
+    }
+}
+
+/// Resolving a vendor's download into a concrete URL and checksum.
+pub mod fetch {
+    use serde::Deserialize;
+
+    use super::{JavaCandidate, JavaVendor};
+    use crate::model::{Digest, HashAlgo};
+
+    #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+    pub enum ResolveError {
+        #[error("{vendor} published no build for Java {major} on this platform")]
+        NoBuild { vendor: JavaVendor, major: u32 },
+        #[error("could not read {vendor}'s download metadata: {message}")]
+        BadMetadata { vendor: JavaVendor, message: String },
+        #[error("{vendor} published a malformed checksum")]
+        BadChecksum { vendor: JavaVendor },
+    }
+
+    /// Where to download from, and what the bytes must hash to.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Download {
+        pub url: String,
+        pub checksum: Option<Digest>,
+        pub size: Option<u64>,
+    }
+
+    /// Oracle publishes checksums as a sibling file containing `<hex>  <filename>`.
+    pub fn parse_sha256_sidecar(body: &str, vendor: JavaVendor) -> Result<Digest, ResolveError> {
+        let hex = body
+            .split_whitespace()
+            .next()
+            .ok_or(ResolveError::BadChecksum { vendor })?;
+        Digest::new(HashAlgo::Sha256, hex).map_err(|_| ResolveError::BadChecksum { vendor })
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct AdoptiumAsset {
+        binary: AdoptiumBinary,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct AdoptiumBinary {
+        package: AdoptiumPackage,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct AdoptiumPackage {
+        link: String,
+        #[serde(default)]
+        checksum: Option<String>,
+        #[serde(default)]
+        size: Option<u64>,
+    }
+
+    /// Read Adoptium's assets response.
+    ///
+    /// The assets endpoint is used rather than the redirect one precisely because the checksum
+    /// arrives inline here, so acquiring and verifying costs one round trip instead of two.
+    pub fn parse_adoptium_assets(body: &[u8], major: u32) -> Result<Download, ResolveError> {
+        let assets: Vec<AdoptiumAsset> =
+            serde_json::from_slice(body).map_err(|e| ResolveError::BadMetadata {
+                vendor: JavaVendor::Adoptium,
+                message: e.to_string(),
+            })?;
+        let first = assets.into_iter().next().ok_or(ResolveError::NoBuild {
+            vendor: JavaVendor::Adoptium,
+            major,
+        })?;
+        let checksum = first
+            .binary
+            .package
+            .checksum
+            .as_deref()
+            .and_then(|hex| Digest::new(HashAlgo::Sha256, hex).ok());
+        Ok(Download {
+            url: first.binary.package.link,
+            checksum,
+            size: first.binary.package.size,
+        })
+    }
+
+    /// The Oracle GraalVM download for a candidate.
+    pub fn graalvm_download(candidate: &JavaCandidate) -> Download {
+        Download {
+            url: candidate.url.clone(),
+            // Fetched separately from the `.sha256` sidecar.
+            checksum: None,
+            size: None,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const SHA256: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+        #[test]
+        fn reads_oracles_checksum_sidecar() {
+            let body = format!("{SHA256}  graalvm-jdk-21_linux-x64_bin.tar.gz\n");
+            let d = parse_sha256_sidecar(&body, JavaVendor::GraalVm).unwrap();
+            assert_eq!(d.algo(), HashAlgo::Sha256);
+            assert_eq!(d.hex(), SHA256);
+        }
+
+        #[test]
+        fn a_bare_checksum_with_no_filename_still_parses() {
+            assert!(parse_sha256_sidecar(SHA256, JavaVendor::GraalVm).is_ok());
+        }
+
+        #[test]
+        fn a_malformed_checksum_is_refused() {
+            for body in ["", "not-hex-at-all", "abc123"] {
+                assert!(
+                    parse_sha256_sidecar(body, JavaVendor::GraalVm).is_err(),
+                    "{body:?} should be refused"
+                );
+            }
+        }
+
+        #[test]
+        fn reads_adoptiums_inline_checksum() {
+            let body = serde_json::json!([{
+                "binary": {
+                    "package": {
+                        "name": "OpenJDK21U-jre_x64_linux_hotspot.tar.gz",
+                        "link": "https://github.com/adoptium/temurin21-binaries/releases/download/x/y.tar.gz",
+                        "checksum": SHA256,
+                        "size": 45000000
+                    }
+                }
+            }]);
+            let d = parse_adoptium_assets(body.to_string().as_bytes(), 21).unwrap();
+            assert!(d.url.contains("temurin21-binaries"));
+            assert_eq!(d.checksum.unwrap().hex(), SHA256);
+            assert_eq!(d.size, Some(45_000_000));
+        }
+
+        #[test]
+        fn an_empty_adoptium_response_means_no_build_for_this_platform() {
+            let err = parse_adoptium_assets(b"[]", 25).unwrap_err();
+            assert!(matches!(err, ResolveError::NoBuild { major: 25, .. }));
+        }
+
+        #[test]
+        fn a_missing_checksum_does_not_fail_the_parse() {
+            // Verification is then by size alone, which the caller decides about.
+            let body = serde_json::json!([{
+                "binary": { "package": { "link": "https://example.test/x.tar.gz" } }
+            }]);
+            let d = parse_adoptium_assets(body.to_string().as_bytes(), 21).unwrap();
+            assert!(d.checksum.is_none());
+        }
+
+        #[test]
+        fn malformed_adoptium_json_is_reported() {
+            assert!(matches!(
+                parse_adoptium_assets(b"{not json", 21).unwrap_err(),
+                ResolveError::BadMetadata { .. }
+            ));
+        }
     }
 }

@@ -20,6 +20,8 @@ tokio.workspace = true
 reqwest.workspace = true
 async-trait.workspace = true
 quick-xml.workspace = true
+tar.workspace = true
+flate2.workspace = true
 futures.workspace = true
 
 [dev-dependencies]

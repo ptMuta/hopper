@@ -237,6 +237,10 @@ pub struct PackRecord {
 pub struct PolicyRecord {
     pub rules_revision: u32,
     pub include_optional: bool,
+    /// The operator asked for mods only, so later runs must not suddenly start installing a
+    /// loader and a JVM they never wanted.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mods_only: bool,
     /// Persisted so overrides need not be retyped on every update.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub force_include: Vec<String>,

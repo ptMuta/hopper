@@ -27,6 +27,8 @@ pub enum BlobError {
     HashMismatch { expected: Digest, actual: Digest },
     #[error("expected sha512 for cache addressing, got {0}")]
     NotSha512(HashAlgo),
+    #[error("internal error: content was not hashed with {algo}, so it cannot be verified")]
+    NotHashed { algo: HashAlgo },
     #[error("content is {actual} bytes but {expected} were declared")]
     SizeMismatch { expected: u64, actual: u64 },
 }
@@ -116,7 +118,13 @@ impl BlobStore {
             next_counter()
         ));
 
-        let mut hasher = MultiHasher::new();
+        // The hasher must cover whatever algorithm the caller will verify against, or the
+        // comparison below can never succeed. JDK vendors publish sha256, which is not part of
+        // the default set.
+        let mut hasher = match expect.map(Digest::algo) {
+            Some(HashAlgo::Sha256) => MultiHasher::new().with_sha256(),
+            _ => MultiHasher::new(),
+        };
         let mut size: u64 = 0;
         {
             let mut out =
@@ -145,13 +153,23 @@ impl BlobStore {
         };
         if let Some(expected) = expect {
             // Compare on whichever algorithm the caller gave us: Modrinth hands out sha512,
-            // but Fabric's meta API and Mojang publish sha1 only.
-            let observed = hashes.get(expected.algo());
-            if observed != Some(expected) {
-                return Err(fail(BlobError::HashMismatch {
-                    expected: expected.clone(),
-                    actual: observed.cloned().unwrap_or_else(|| digest.clone()),
-                }));
+            // Fabric's meta API and Mojang publish sha1, and JDK vendors publish sha256.
+            match hashes.get(expected.algo()) {
+                Some(observed) if observed == expected => {}
+                Some(observed) => {
+                    return Err(fail(BlobError::HashMismatch {
+                        expected: expected.clone(),
+                        actual: observed.clone(),
+                    }));
+                }
+                // Would mean the hasher was not set up for this algorithm, which is a bug
+                // rather than a bad download -- say so instead of reporting a mismatch between
+                // two different algorithms, which reads as nonsense.
+                None => {
+                    return Err(fail(BlobError::NotHashed {
+                        algo: expected.algo(),
+                    }));
+                }
             }
         }
         if let Some(expected) = expect_size
@@ -328,6 +346,30 @@ mod tests {
 
         let bad_sha1 = Digest::new(HashAlgo::Sha1, &"f".repeat(40)).unwrap();
         assert!(s.insert_bytes(b"payload", Some(&bad_sha1)).is_err());
+    }
+
+    #[test]
+    fn verifies_against_a_sha256_which_is_what_jdk_vendors_publish() {
+        // The default hasher does not compute sha256, so this only works because insert_reader
+        // widens it based on what is being verified.
+        let (_d, s) = store();
+        let mut h = MultiHasher::new().with_sha256();
+        h.update(b"jdk bytes");
+        let (all, _) = h.finish();
+        let sha256 = all.get(HashAlgo::Sha256).unwrap().clone();
+
+        let blob = s.insert_bytes(b"jdk bytes", Some(&sha256)).unwrap();
+        assert_eq!(
+            blob.digest.algo(),
+            HashAlgo::Sha512,
+            "still addressed by sha512"
+        );
+
+        let wrong = Digest::new(HashAlgo::Sha256, &"c".repeat(64)).unwrap();
+        assert!(matches!(
+            s.insert_bytes(b"jdk bytes", Some(&wrong)).unwrap_err(),
+            BlobError::HashMismatch { .. }
+        ));
     }
 
     #[test]

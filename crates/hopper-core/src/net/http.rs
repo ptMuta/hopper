@@ -100,8 +100,12 @@ impl HttpClient {
         let inner = reqwest::Client::builder()
             .user_agent(user_agent)
             .redirect(policy)
-            .timeout(Duration::from_secs(120))
-            .connect_timeout(Duration::from_secs(15))
+            // Deliberately no total-request timeout. A JDK is a few hundred megabytes, and a
+            // whole-request deadline turns a slow link into a hard failure no retry can fix.
+            // Bound connecting and stalling instead: a transfer that is still making progress
+            // is not a problem, however long it takes.
+            .connect_timeout(Duration::from_secs(20))
+            .read_timeout(Duration::from_secs(60))
             .build()
             .map_err(|e| HttpError::Transport {
                 url: "<client>".into(),
@@ -286,6 +290,85 @@ impl HttpClient {
         })
     }
 
+    /// Stream a response body into the content store.
+    ///
+    /// Streaming rather than buffering matters once JDKs are in scope: holding a few hundred
+    /// megabytes in memory to hash it is avoidable, and on a small VPS it is the difference
+    /// between working and being killed by the OOM reaper.
+    async fn stream_to_store(
+        &self,
+        url: &str,
+        expect: Option<&Digest>,
+        expect_size: Option<u64>,
+        store: &BlobStore,
+    ) -> Result<Blob, HttpError> {
+        use futures::StreamExt;
+
+        let parsed = url::Url::parse(url).map_err(|_| HttpError::BadUrl {
+            url: url.to_owned(),
+        })?;
+        self.allow
+            .check(&parsed)
+            .map_err(|source| HttpError::Host {
+                url: url.to_owned(),
+                source,
+            })?;
+
+        self.await_budget().await;
+        let resp = self
+            .inner
+            .get(parsed)
+            .send()
+            .await
+            .map_err(|e| HttpError::Transport {
+                url: url.to_owned(),
+                message: e.to_string(),
+            })?;
+
+        let status = resp.status().as_u16();
+        self.observe(resp.headers(), status);
+        if !resp.status().is_success() {
+            return Err(HttpError::Status {
+                url: url.to_owned(),
+                status,
+            });
+        }
+
+        // Pipe the body through a blocking writer so hashing never stalls the runtime.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(8);
+        let store = store.clone();
+        let expect = expect.cloned();
+        let writer = tokio::task::spawn_blocking(move || {
+            let mut reader = ChannelReader {
+                rx,
+                current: Vec::new(),
+                offset: 0,
+            };
+            store.insert_reader(&mut reader, expect.as_ref(), expect_size)
+        });
+
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| HttpError::Transport {
+                url: url.to_owned(),
+                message: e.to_string(),
+            })?;
+            if tx.send(Ok(chunk.to_vec())).is_err() {
+                // The writer stopped early, which means it failed; its error is the real one.
+                break;
+            }
+        }
+        drop(tx);
+
+        writer
+            .await
+            .map_err(|e| HttpError::Transport {
+                url: url.to_owned(),
+                message: e.to_string(),
+            })?
+            .map_err(HttpError::Blob)
+    }
+
     /// Fetch into the content store, trying each mirror in turn.
     ///
     /// Verification happens inside the store, so a mismatched download is discarded rather than
@@ -309,23 +392,9 @@ impl HttpClient {
 
         let mut last: Option<HttpError> = None;
         for url in urls {
-            match self.get_bytes(url).await {
-                Ok(bytes) => match store.insert_bytes(&bytes, expect) {
-                    Ok(blob) => {
-                        if let Some(expected) = expect_size
-                            && blob.size != expected
-                        {
-                            last = Some(HttpError::Blob(BlobError::SizeMismatch {
-                                expected,
-                                actual: blob.size,
-                            }));
-                            continue;
-                        }
-                        return Ok(blob);
-                    }
-                    // A bad mirror should not doom the download; try the next one.
-                    Err(e) => last = Some(HttpError::Blob(e)),
-                },
+            match self.stream_to_store(url, expect, expect_size, store).await {
+                Ok(blob) => return Ok(blob),
+                // A bad mirror should not doom the download; try the next one.
                 Err(e) => last = Some(e),
             }
         }
@@ -333,6 +402,33 @@ impl HttpClient {
         Err(last.unwrap_or(HttpError::BadUrl {
             url: "<no mirrors given>".into(),
         }))
+    }
+}
+
+/// Adapts the chunk channel to `Read` for the blocking hasher.
+struct ChannelReader {
+    rx: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    current: Vec<u8>,
+    offset: usize,
+}
+
+impl std::io::Read for ChannelReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.offset >= self.current.len() {
+            match self.rx.recv() {
+                Ok(Ok(chunk)) => {
+                    self.current = chunk;
+                    self.offset = 0;
+                }
+                Ok(Err(e)) => return Err(e),
+                // Sender dropped: the body is complete.
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = buf.len().min(self.current.len() - self.offset);
+        buf[..n].copy_from_slice(&self.current[self.offset..self.offset + n]);
+        self.offset += n;
+        Ok(n)
     }
 }
 

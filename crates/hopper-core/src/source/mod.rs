@@ -3,6 +3,9 @@
 pub mod collection;
 pub mod mrpack;
 pub mod resolve;
+/// Experimental, off by default: Modrinth publishes no API for shared instances.
+#[cfg(feature = "shared-instances")]
+pub mod shared;
 pub mod spec;
 
 pub use mrpack::stage_overrides;

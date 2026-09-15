@@ -584,7 +584,17 @@ async fn fetch_from_registry(
 
 fn scan(root: &Path, interesting: &[RelPath]) -> DiskState {
     let mut disk = DiskState::new();
-    for path in interesting {
+
+    // `<path>.disabled` has to be in the scan or reconcile cannot see the marker, and an
+    // update would silently re-install a mod the operator deliberately switched off.
+    let mut paths: Vec<RelPath> = interesting.to_vec();
+    paths.extend(
+        interesting
+            .iter()
+            .filter_map(|p| p.with_suffix(".disabled").ok()),
+    );
+
+    for path in &paths {
         let full = path.resolve_under(root);
         if let Ok(hopper_core::fs::FileKind::File) = hfs::kind_of(&full)
             && let Ok((_, digest)) = hfs::hash_file(&full)

@@ -192,6 +192,31 @@ fn an_update_preserves_operator_work_and_removes_what_the_pack_dropped() {
 }
 
 #[test]
+fn a_disabled_mod_is_not_reinstalled_by_the_next_update() {
+    // `disable` renames rather than deletes precisely so an update respects it. That only
+    // works if the scan looks for the marker, which it did not at first: the mod came back.
+    let s = Server::new();
+    let pack = s.dir.path().join("v1.mrpack");
+    build_pack(&pack, "1.0.0", &[("overrides/config/a.toml", "x=1\n")]);
+    s.install(&pack, &["--yes", "--eula"]);
+
+    // Stand in for a mod by disabling a tracked file.
+    std::fs::rename(
+        s.root().join("config/a.toml"),
+        s.root().join("config/a.toml.disabled"),
+    )
+    .unwrap();
+
+    let (out, err, code) = s.install(&pack, &["--yes"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(
+        !s.exists("config/a.toml"),
+        "an update must not undo a deliberate disable:\n{out}"
+    );
+    assert!(s.exists("config/a.toml.disabled"));
+}
+
+#[test]
 fn a_second_identical_run_does_nothing() {
     let s = Server::new();
     let pack = s.dir.path().join("v1.mrpack");

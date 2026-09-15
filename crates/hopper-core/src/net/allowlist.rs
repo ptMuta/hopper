@@ -62,6 +62,10 @@ pub const RUNTIME_HOSTS: &[&str] = &[
     "objects.githubusercontent.com",
 ];
 
+/// Registry API hosts. Separate from [`PACK_HOSTS`] because an API that tells us what to
+/// download is a different concern from the hosts we will download from.
+pub const API_HOSTS: &[&str] = &["api.modrinth.com", "staging-api.modrinth.com"];
+
 #[derive(Debug, Clone)]
 pub struct HostAllowlist {
     domain: &'static str,
@@ -75,6 +79,13 @@ impl HostAllowlist {
 
     pub fn runtimes() -> Self {
         Self::new("runtime downloads", RUNTIME_HOSTS)
+    }
+
+    /// API calls plus the CDN they hand out URLs for.
+    pub fn api() -> Self {
+        let mut hosts: Vec<&str> = API_HOSTS.to_vec();
+        hosts.extend_from_slice(PACK_HOSTS);
+        Self::new("registry API", &hosts)
     }
 
     pub fn new(domain: &'static str, hosts: &[&str]) -> Self {
@@ -230,6 +241,21 @@ mod tests {
         ] {
             assert!(a.check(&u(url)).is_ok(), "should accept {url}");
         }
+    }
+
+    #[test]
+    fn the_api_allowlist_covers_the_api_and_the_cdn_it_points_at() {
+        let a = HostAllowlist::api();
+        assert!(
+            a.check(&u("https://api.modrinth.com/v2/project/sodium"))
+                .is_ok()
+        );
+        // Version metadata hands out CDN URLs, so both have to be reachable from one client.
+        assert!(
+            a.check(&u("https://cdn.modrinth.com/data/X/pack.mrpack"))
+                .is_ok()
+        );
+        assert!(a.check(&u("https://evil.test/x")).is_err());
     }
 
     #[test]

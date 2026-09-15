@@ -234,12 +234,15 @@ async fn install(cli: &Cli) -> Result<i32> {
 
     let cache = cache_dir()?;
     let store = BlobStore::new(&cache);
-    let client = HttpClient::new(&user_agent(), HostAllowlist::packs())
-        .context("building the HTTP client")?;
+    // One client for both the API and the CDN it hands out URLs for; pack downloads are
+    // still checked against the pack allowlist when they happen.
+    let client =
+        HttpClient::new(&user_agent(), HostAllowlist::api()).context("building the HTTP client")?;
 
     // 1. Resolve the source into a pack, keeping the archive bytes so overrides can be
     //    staged out of it.
-    let archive = load_archive(&spec, &client, &source_arg).await?;
+    let wanted_mc = cli.install.mc.as_deref().map(MinecraftVersion::new);
+    let archive = load_archive(&spec, &client, &source_arg, wanted_mc.as_ref()).await?;
     let pack = mrpack::read(std::io::Cursor::new(&archive), &HostAllowlist::packs())
         .context("reading the modpack")?;
     let override_content =
@@ -251,13 +254,13 @@ async fn install(cli: &Cli) -> Result<i32> {
             "{}{}",
             pack.index.name,
             pack.index
-                .summary
-                .as_ref()
-                .map(|s| format!(" — {s}"))
-                .unwrap_or_default()
+                .version_id
+                .is_empty()
+                .then(String::new)
+                .unwrap_or_else(|| format!(" {}", pack.index.version_id))
         );
         println!(
-            "Minecraft {} · {} · {}\n",
+            "Minecraft {}, {}, into {}\n",
             pack.index.minecraft,
             pack.index.loader,
             root.display()
@@ -453,7 +456,14 @@ async fn install(cli: &Cli) -> Result<i32> {
 // ---------------------------------------------------------------- helpers
 
 /// Fetch the raw `.mrpack` bytes for whatever the operator named.
-async fn load_archive(spec: &SourceSpec, client: &HttpClient, source_arg: &str) -> Result<Vec<u8>> {
+/// Fetch the raw `.mrpack` bytes for whatever the operator named.
+async fn load_archive(
+    spec: &SourceSpec,
+    client: &HttpClient,
+    source_arg: &str,
+    mc: Option<&MinecraftVersion>,
+) -> Result<Vec<u8>> {
+    let _ = source_arg;
     let bytes = match spec {
         SourceSpec::File { path } => {
             hfs::read(Path::new(path)).with_context(|| format!("reading {path}"))?
@@ -462,12 +472,12 @@ async fn load_archive(spec: &SourceSpec, client: &HttpClient, source_arg: &str) 
             .get_bytes(url.as_str())
             .await
             .with_context(|| format!("downloading {url}"))?,
-        SourceSpec::Pack { .. } | SourceSpec::Ambiguous { .. } => {
-            bail!(
-                "installing {source_arg:?} from Modrinth by slug is not wired up yet.\n\
-                 help: download the .mrpack from the pack's Versions tab and run\n        \
-                 hopper ./<file>.mrpack"
-            )
+        SourceSpec::Pack { slug, version } => {
+            fetch_from_registry(client, slug, version.as_deref(), mc).await?
+        }
+        // A bare token is resolved as a pack first; collections come later.
+        SourceSpec::Ambiguous { token, version } => {
+            fetch_from_registry(client, token, version.as_deref(), mc).await?
         }
         SourceSpec::Collection { .. } => bail!("collections are not wired up yet"),
         SourceSpec::SharedInstance { .. } => {
@@ -475,6 +485,44 @@ async fn load_archive(spec: &SourceSpec, client: &HttpClient, source_arg: &str) 
         }
     };
     Ok(bytes)
+}
+
+/// Look a pack up on Modrinth and download its `.mrpack`.
+async fn fetch_from_registry(
+    client: &HttpClient,
+    slug: &str,
+    version: Option<&str>,
+    mc: Option<&MinecraftVersion>,
+) -> Result<Vec<u8>> {
+    use hopper_core::api::client as registry;
+
+    let project = registry::fetch_project(client, slug)
+        .await
+        .with_context(|| format!("looking up {slug:?} on Modrinth"))?;
+    registry::require_modpack(&project, slug)?;
+
+    let versions = registry::fetch_versions(client, project.id.as_str())
+        .await
+        .with_context(|| format!("listing versions of {slug:?}"))?;
+    let chosen = registry::choose_version(&versions, slug, version, mc)?;
+    let pack = registry::pack_file(&chosen, slug)?;
+
+    if !matches!(
+        pack.version_type,
+        Some(hopper_core::api::modrinth::VersionType::Release) | None
+    ) {
+        // Worth saying out loud: the operator asked for a pack and is getting a prerelease
+        // because no stable version exists.
+        println!(
+            "note: {} has no stable release; installing {} ({:?})",
+            project.title, pack.version_number, pack.version_type
+        );
+    }
+
+    client
+        .get_bytes(&pack.file_url)
+        .await
+        .with_context(|| format!("downloading {}", pack.file_name))
 }
 
 fn scan(root: &Path, interesting: &[RelPath]) -> DiskState {

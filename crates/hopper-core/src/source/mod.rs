@@ -1,5 +1,6 @@
 //! Turning something the user typed into a concrete set of files to install.
 
+pub mod collection;
 pub mod mrpack;
 pub mod resolve;
 pub mod spec;

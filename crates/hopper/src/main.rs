@@ -243,12 +243,32 @@ async fn install(cli: &Cli) -> Result<i32> {
     // 1. Resolve the source into a pack, keeping the archive bytes so overrides can be
     //    staged out of it.
     let wanted_mc = cli.install.mc.as_deref().map(MinecraftVersion::new);
-    let archive = load_archive(&spec, &client, &source_arg, wanted_mc.as_ref()).await?;
-    let pack = mrpack::read(std::io::Cursor::new(&archive), &HostAllowlist::packs())
-        .context("reading the modpack")?;
-    let override_content =
-        mrpack::stage_overrides(std::io::Cursor::new(&archive), &pack.overrides, &store)
-            .context("extracting the pack's config files")?;
+
+    // A collection has no archive to download: it is a list of projects, and hopper picks
+    // which versions of them to install. Everything downstream is identical, so it is turned
+    // into a pack here rather than becoming a second code path.
+    let (pack, override_content) = match &spec {
+        SourceSpec::Collection { id } => {
+            let pack = resolve_collection(
+                &client,
+                id,
+                wanted_mc.as_ref(),
+                cli.install.loader.map(Into::into),
+                cli.global.quiet,
+            )
+            .await?;
+            (pack, Default::default())
+        }
+        _ => {
+            let archive = load_archive(&spec, &client, &source_arg, wanted_mc.as_ref()).await?;
+            let pack = mrpack::read(std::io::Cursor::new(&archive), &HostAllowlist::packs())
+                .context("reading the modpack")?;
+            let overrides =
+                mrpack::stage_overrides(std::io::Cursor::new(&archive), &pack.overrides, &store)
+                    .context("extracting the pack's config files")?;
+            (pack, overrides)
+        }
+    };
 
     if !cli.global.quiet {
         println!(
@@ -516,7 +536,7 @@ async fn load_archive(
         SourceSpec::Ambiguous { token, version } => {
             fetch_from_registry(client, token, version.as_deref(), mc).await?
         }
-        SourceSpec::Collection { .. } => bail!("collections are not wired up yet"),
+        SourceSpec::Collection { .. } => unreachable!("handled before load_archive"),
         SourceSpec::SharedInstance { .. } => {
             bail!("shared instances are experimental and not wired up yet")
         }
@@ -592,6 +612,122 @@ fn count_user_files(root: &Path, lock: &Option<Lockfile>) -> usize {
             lock.as_ref().is_none_or(|l| l.file(&path).is_none())
         })
         .count()
+}
+
+/// Turn a collection into a pack.
+///
+/// Collections pin no versions and declare no Minecraft version or loader, so hopper has to
+/// choose. Rather than demanding both up front, it solves for the pair covering the most
+/// projects and shows the trade-off, including what would be left out.
+async fn resolve_collection(
+    client: &HttpClient,
+    id: &str,
+    wanted_mc: Option<&MinecraftVersion>,
+    wanted_loader: Option<hopper_core::model::LoaderKind>,
+    quiet: bool,
+) -> Result<Mrpack> {
+    use hopper_core::api::modrinth::{API_V3, WireCollection, WireVersion};
+    use hopper_core::model::LoaderKind;
+    use hopper_core::source::collection;
+    use hopper_core::source::mrpack::{IndexFile, MrpackIndex};
+
+    let collection: WireCollection = client
+        .get_json(&format!("{API_V3}/collection/{id}"))
+        .await
+        .with_context(|| format!("fetching collection {id}"))?;
+
+    if collection.projects.is_empty() {
+        bail!("collection {:?} is empty", collection.name);
+    }
+    if !quiet {
+        println!(
+            "Collection \"{}\" ({} projects)",
+            collection.name,
+            collection.projects.len()
+        );
+    }
+
+    // One request per project: collections have no batch version endpoint.
+    let mut by_project = std::collections::BTreeMap::new();
+    for project in &collection.projects {
+        let versions: Vec<WireVersion> =
+            hopper_core::api::client::fetch_versions(client, project.as_str())
+                .await
+                .with_context(|| format!("listing versions of {project}"))?;
+        by_project.insert(project.clone(), versions);
+    }
+
+    let mc_candidates = match wanted_mc {
+        Some(mc) => vec![mc.clone()],
+        None => collection::candidate_minecraft_versions(&by_project),
+    };
+    let loaders = match wanted_loader {
+        Some(l) => vec![l],
+        None => vec![LoaderKind::Fabric, LoaderKind::NeoForge, LoaderKind::Quilt],
+    };
+    let ranked = collection::rank_targets(&by_project, &mc_candidates, &loaders);
+    let best = ranked
+        .first()
+        .context("no usable target for this collection")?;
+
+    if !quiet {
+        println!(
+            "  picked Minecraft {} with {}: {} of {} projects",
+            best.minecraft, best.loader, best.covered, best.total
+        );
+        if !best.missing.is_empty() {
+            // Project ids alone are unreadable, and resolving them to names would cost a
+            // request each, so report the count and point at the collection.
+            println!(
+                "    {} project(s) have nothing for this combination",
+                best.missing.len()
+            );
+        }
+        // Say what the alternatives were, so the choice is reviewable rather than magic.
+        for other in ranked.iter().skip(1).take(2) {
+            println!(
+                "  alternative: Minecraft {} with {} covers {} of {}",
+                other.minecraft, other.loader, other.covered, other.total
+            );
+        }
+        println!();
+    }
+
+    let chosen = collection::select_versions(&by_project, &best.minecraft, best.loader);
+    let mut files = Vec::new();
+    for version in chosen.into_values() {
+        let resolved = match version.into_version() {
+            Ok(v) => v,
+            // A project with no usable file is skipped rather than failing the whole install.
+            Err(_) => continue,
+        };
+        let filename = resolved.file.filename.clone();
+        let path = hopper_core::model::RelPath::parse(&format!("mods/{filename}"))
+            .with_context(|| format!("{filename:?} is not a usable filename"))?;
+        files.push(IndexFile {
+            path,
+            hashes: resolved.file.hashes.clone(),
+            downloads: vec![resolved.file.url.clone()],
+            // Collections carry no environment data, so classification falls to the registry
+            // metadata and the curated rules.
+            env: None,
+            size: Some(resolved.file.size),
+        });
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(Mrpack {
+        index: MrpackIndex {
+            name: collection.name.clone(),
+            version_id: String::new(),
+            summary: collection.description.clone(),
+            minecraft: best.minecraft.clone(),
+            loader: best.loader,
+            loader_version: None,
+            files,
+        },
+        overrides: vec![],
+    })
 }
 
 /// Resolve the server jar, the loader and a JVM.

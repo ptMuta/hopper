@@ -1,0 +1,242 @@
+//! Download host allowlisting.
+//!
+//! A `.mrpack` is a manifest of arbitrary URLs that a trusted process fetches unattended. Without
+//! a host restriction, a pack author (or anyone who can modify a pack in transit or at rest)
+//! could point `downloads[]` at infrastructure they control, or at an address inside the
+//! operator's own network. Modrinth therefore restricts pack downloads to a small set of hosts,
+//! and hopper enforces that rather than trusting the manifest.
+//!
+//! Two properties are easy to get wrong and are handled explicitly here:
+//!
+//! * **Redirects.** Checking only the URL written in the manifest is not enough — an allowed
+//!   host that responds `302` to an arbitrary location would bypass the list entirely. Every hop
+//!   must be re-checked, which is why [`HostAllowlist::check`] is designed to be called per hop
+//!   rather than once per download.
+//! * **Separate trust domains.** Pack content and JDK downloads come from different places and
+//!   carry different risk. They get separate lists rather than one union, so a compromise of the
+//!   pack surface cannot reach the JVM surface.
+
+use url::Url;
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HostError {
+    #[error("refusing to download from {host:?}, which is not an allowed host for {domain}")]
+    NotAllowed { host: String, domain: &'static str },
+    #[error("refusing to download over {scheme:?}; only https is allowed")]
+    NotHttps { scheme: String },
+    #[error("refusing a URL that embeds credentials")]
+    HasCredentials,
+    #[error("URL has no host")]
+    NoHost,
+}
+
+/// Hosts a `.mrpack` may reference. Matches Modrinth's published allowlist.
+pub const PACK_HOSTS: &[&str] = &[
+    "cdn.modrinth.com",
+    "github.com",
+    "raw.githubusercontent.com",
+    "gitlab.com",
+];
+
+/// Hosts JDK archives and loader installers may come from. Deliberately disjoint from
+/// [`PACK_HOSTS`] — these are different trust domains and must not be merged.
+pub const RUNTIME_HOSTS: &[&str] = &[
+    // Mojang
+    "piston-meta.mojang.com",
+    "piston-data.mojang.com",
+    "launchermeta.mojang.com",
+    "launcher.mojang.com",
+    "resources.download.minecraft.net",
+    // Loaders
+    "meta.fabricmc.net",
+    "maven.fabricmc.net",
+    "maven.quiltmc.org",
+    "maven.neoforged.net",
+    "maven.minecraftforge.net",
+    "files.minecraftforge.net",
+    "repo1.maven.org",
+    // JVMs
+    "download.oracle.com",
+    "api.adoptium.net",
+    "github.com",
+    "objects.githubusercontent.com",
+];
+
+#[derive(Debug, Clone)]
+pub struct HostAllowlist {
+    domain: &'static str,
+    hosts: Vec<String>,
+}
+
+impl HostAllowlist {
+    pub fn packs() -> Self {
+        Self::new("pack downloads", PACK_HOSTS)
+    }
+
+    pub fn runtimes() -> Self {
+        Self::new("runtime downloads", RUNTIME_HOSTS)
+    }
+
+    pub fn new(domain: &'static str, hosts: &[&str]) -> Self {
+        Self {
+            domain,
+            hosts: hosts.iter().map(|h| h.to_ascii_lowercase()).collect(),
+        }
+    }
+
+    /// Permit an extra host. For self-hosted Modrinth instances and mirrors — an explicit
+    /// operator decision, never something a pack can ask for.
+    pub fn allow(&mut self, host: &str) {
+        self.hosts.push(host.to_ascii_lowercase());
+    }
+
+    /// Check one URL. Call this for **every** redirect hop, not once per download.
+    pub fn check(&self, url: &Url) -> Result<(), HostError> {
+        if url.scheme() != "https" {
+            return Err(HostError::NotHttps {
+                scheme: url.scheme().to_owned(),
+            });
+        }
+        // `https://cdn.modrinth.com@evil.test/` parses with host `evil.test`; rejecting
+        // credentials outright removes a class of look-alike URLs from review.
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(HostError::HasCredentials);
+        }
+        let host = url
+            .host_str()
+            .ok_or(HostError::NoHost)?
+            .to_ascii_lowercase();
+
+        // Exact match only. A suffix check would accept `cdn.modrinth.com.evil.test`.
+        if self.hosts.contains(&host) {
+            Ok(())
+        } else {
+            Err(HostError::NotAllowed {
+                host,
+                domain: self.domain,
+            })
+        }
+    }
+
+    pub fn hosts(&self) -> &[String] {
+        &self.hosts
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn u(s: &str) -> Url {
+        Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn accepts_the_published_pack_hosts() {
+        let a = HostAllowlist::packs();
+        for url in [
+            "https://cdn.modrinth.com/data/AANobbMI/versions/x/sodium.jar",
+            "https://github.com/org/repo/releases/download/v1/mod.jar",
+            "https://raw.githubusercontent.com/org/repo/main/mod.jar",
+            "https://gitlab.com/org/repo/-/raw/main/mod.jar",
+        ] {
+            assert!(a.check(&u(url)).is_ok(), "should accept {url}");
+        }
+    }
+
+    #[test]
+    fn rejects_unlisted_hosts() {
+        let a = HostAllowlist::packs();
+        assert!(matches!(
+            a.check(&u("https://evil.test/payload.jar")).unwrap_err(),
+            HostError::NotAllowed { .. }
+        ));
+    }
+
+    #[test]
+    fn matching_is_exact_not_suffix() {
+        // The bug a naive `ends_with` check would introduce.
+        let a = HostAllowlist::packs();
+        for url in [
+            "https://cdn.modrinth.com.evil.test/x.jar",
+            "https://notgithub.com/x.jar",
+            "https://evil.test/cdn.modrinth.com/x.jar",
+        ] {
+            assert!(a.check(&u(url)).is_err(), "should reject {url}");
+        }
+    }
+
+    #[test]
+    fn subdomains_are_not_implicitly_trusted() {
+        let a = HostAllowlist::packs();
+        assert!(a.check(&u("https://pages.github.com/x.jar")).is_err());
+    }
+
+    #[test]
+    fn rejects_plaintext_and_non_http_schemes() {
+        let a = HostAllowlist::packs();
+        assert!(matches!(
+            a.check(&u("http://cdn.modrinth.com/x.jar")).unwrap_err(),
+            HostError::NotHttps { .. }
+        ));
+        assert!(a.check(&u("file:///etc/passwd")).is_err());
+        assert!(a.check(&u("ftp://cdn.modrinth.com/x.jar")).is_err());
+    }
+
+    #[test]
+    fn rejects_embedded_credentials() {
+        // Parses with host `evil.test`, but reads like the CDN at a glance.
+        let a = HostAllowlist::packs();
+        assert!(matches!(
+            a.check(&u("https://cdn.modrinth.com@evil.test/x.jar"))
+                .unwrap_err(),
+            HostError::HasCredentials
+        ));
+    }
+
+    #[test]
+    fn host_comparison_ignores_case() {
+        let a = HostAllowlist::packs();
+        assert!(a.check(&u("https://CDN.Modrinth.COM/x.jar")).is_ok());
+    }
+
+    #[test]
+    fn pack_and_runtime_domains_stay_separate() {
+        // A compromise of the pack surface must not reach the JVM surface, and vice versa.
+        let packs = HostAllowlist::packs();
+        let runtimes = HostAllowlist::runtimes();
+        assert!(
+            packs
+                .check(&u("https://download.oracle.com/graalvm/21/latest/x.tar.gz"))
+                .is_err()
+        );
+        assert!(
+            runtimes
+                .check(&u("https://cdn.modrinth.com/data/x/sodium.jar"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn runtime_hosts_cover_every_vendor_we_fetch_from() {
+        let a = HostAllowlist::runtimes();
+        for url in [
+            "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json",
+            "https://meta.fabricmc.net/v2/versions/loader/26.3",
+            "https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml",
+            "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json",
+            "https://download.oracle.com/graalvm/21/latest/graalvm-jdk-21_linux-x64_bin.tar.gz",
+            "https://api.adoptium.net/v3/assets/latest/21/hotspot",
+        ] {
+            assert!(a.check(&u(url)).is_ok(), "should accept {url}");
+        }
+    }
+
+    #[test]
+    fn operators_can_add_a_mirror() {
+        let mut a = HostAllowlist::packs();
+        assert!(a.check(&u("https://mirror.internal/x.jar")).is_err());
+        a.allow("mirror.internal");
+        assert!(a.check(&u("https://mirror.internal/x.jar")).is_ok());
+    }
+}

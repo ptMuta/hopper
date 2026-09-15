@@ -1,0 +1,15 @@
+[package]
+name = "hopper-mc"
+description = "Install and update Minecraft server modpacks from Modrinth."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "hopper"
+path = "src/main.rs"
+
+[dependencies]
+hopper-core = { path = "../hopper-core", version = "0.1.0" }

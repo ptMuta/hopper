@@ -1,0 +1,24 @@
+[package]
+name = "hopper-core"
+description = "Engine for hopper: resolve, plan and apply Minecraft server modpacks."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+hex.workspace = true
+url.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+rstest = "0.23"
+zip.workspace = true
+serde_json.workspace = true
+tempfile = "3"

@@ -47,9 +47,16 @@ pub enum Decision {
     /// Stop tracking, leave the bytes alone.
     Untrack { reason: UntrackReason },
     /// Needs a decision; `resolution` says what we will do absent further instruction.
+    ///
+    /// Carries both sides of the disagreement so the plan is self-contained: rendering the
+    /// diff and applying it both work from this value alone, with nothing re-derived.
     Conflict {
         reason: ConflictReason,
         resolution: ConflictResolution,
+        /// What the pack wants here, when it wants anything.
+        desired: Option<Digest>,
+        /// What is on disk now, when we were able to read it.
+        on_disk: Option<Digest>,
     },
     /// Refused outright. Never resolved automatically.
     Reject { reason: RejectReason },
@@ -259,18 +266,24 @@ pub fn classify(t: &Triple<'_>, pol: &ConflictPolicy) -> Decision {
                 content: w.content.clone(),
                 reconciled: false,
             },
-            Some(_) if pol.adopt_collisions => Decision::Conflict {
+            Some(dd) if pol.adopt_collisions => Decision::Conflict {
                 reason: ConflictReason::UntrackedCollision,
                 resolution: ConflictResolution::BackupThenWrite,
+                desired: Some(w.content.clone()),
+                on_disk: Some(dd.clone()),
             },
-            Some(_) => Decision::Conflict {
+            Some(dd) => Decision::Conflict {
                 reason: ConflictReason::UntrackedCollision,
                 resolution: ConflictResolution::Skip,
+                desired: Some(w.content.clone()),
+                on_disk: Some(dd.clone()),
             },
             // Existence known but content not read; treat as a collision rather than assume.
             None => Decision::Conflict {
                 reason: ConflictReason::UntrackedCollision,
                 resolution: ConflictResolution::Skip,
+                desired: Some(w.content.clone()),
+                on_disk: None,
             },
         },
 
@@ -336,6 +349,8 @@ pub fn classify(t: &Triple<'_>, pol: &ConflictPolicy) -> Decision {
                 return Decision::Conflict {
                     reason: ConflictReason::LocalModification,
                     resolution: ConflictResolution::Skip,
+                    desired: Some(w.content.clone()),
+                    on_disk: None,
                 };
             };
 
@@ -359,6 +374,8 @@ pub fn classify(t: &Triple<'_>, pol: &ConflictPolicy) -> Decision {
                     Decision::Conflict {
                         reason: ConflictReason::UntrackedCollision,
                         resolution: ConflictResolution::Skip,
+                        desired: Some(w.content.clone()),
+                        on_disk: Some(dd.clone()),
                     }
                 };
             }
@@ -398,6 +415,8 @@ pub fn classify(t: &Triple<'_>, pol: &ConflictPolicy) -> Decision {
                 (false, false, false) => Decision::Conflict {
                     reason: ConflictReason::LocalModification,
                     resolution: pol.resolution_for(&w.provenance, w.managed),
+                    desired: Some(w.content.clone()),
+                    on_disk: Some(dd.clone()),
                 },
                 // Equality is transitive: any two of these imply the third, so the remaining
                 // three combinations cannot occur. Compiles to nothing; documents the proof.

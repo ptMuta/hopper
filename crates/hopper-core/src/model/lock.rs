@@ -300,11 +300,28 @@ impl Lockfile {
         serde_json::to_string_pretty(&out).map_err(|e| LockError::Malformed(e.to_string()))
     }
 
+    /// Look up a tracked file.
+    ///
+    /// Relies on `files` being sorted by path, which [`Lockfile::load`] and
+    /// [`Lockfile::to_json`] both enforce. The debug assertion exists because the failure mode
+    /// of an unsorted list is silent -- lookups simply miss, and a caller concludes the file is
+    /// untracked -- which is far worse than a loud panic in a test build.
     pub fn file(&self, path: &RelPath) -> Option<&LockedFile> {
+        debug_assert!(
+            self.files.windows(2).all(|w| w[0].path < w[1].path),
+            "Lockfile::file requires files sorted by path; build it with Lockfile::sorted"
+        );
         self.files
             .binary_search_by(|f| f.path.cmp(path))
             .ok()
             .map(|i| &self.files[i])
+    }
+
+    /// Sort and de-duplicate entries, establishing the invariant `file` depends on.
+    pub fn sorted(mut files: Vec<LockedFile>) -> Vec<LockedFile> {
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        files.dedup_by(|a, b| a.path == b.path);
+        files
     }
 }
 

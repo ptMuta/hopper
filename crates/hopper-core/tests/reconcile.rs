@@ -191,6 +191,8 @@ fn untracked_file_differing_from_the_pack_is_a_conflict_not_an_overwrite() {
         Decision::Conflict {
             reason: ConflictReason::UntrackedCollision,
             resolution: ConflictResolution::Skip,
+            desired: Some(d(1)),
+            on_disk: Some(d(2)),
         }
     );
     assert!(!got.mutates(), "must not touch a file we do not own");
@@ -208,6 +210,8 @@ fn adopt_collisions_opt_in_backs_up_first() {
         Decision::Conflict {
             reason: ConflictReason::UntrackedCollision,
             resolution: ConflictResolution::BackupThenWrite,
+            desired: Some(d(1)),
+            on_disk: Some(d(2)),
         }
     );
 }
@@ -366,6 +370,8 @@ fn modified_and_upgraded_is_a_real_conflict() {
         Decision::Conflict {
             reason: ConflictReason::LocalModification,
             resolution: ConflictResolution::BackupThenWrite,
+            desired: Some(d(2)),
+            on_disk: Some(d(3)),
         }
     );
 }

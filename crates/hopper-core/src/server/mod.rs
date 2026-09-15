@@ -1,0 +1,367 @@
+//! Making an installed pack into a server that starts.
+//!
+//! Beyond jars, a Minecraft server needs `eula.txt` accepted, a `server.properties`, and some
+//! way to be launched. hopper generates a `start.sh` so that one command works regardless of
+//! loader — which is the only way to hide the Fabric-launch-jar versus NeoForge-argfile split
+//! from the operator.
+
+use crate::java::JavaVendor;
+use crate::loader::LaunchProfile;
+use crate::model::RelPath;
+
+pub const EULA_URL: &str = "https://aka.ms/MinecraftEULA";
+
+/// Contents of `eula.txt`.
+///
+/// Only ever written on an explicit decision by the operator: accepting a licence agreement on
+/// someone's behalf because they passed a "don't prompt me" flag is not defensible, which is
+/// why `--yes` does not imply this.
+pub fn eula_file(accepted: bool) -> String {
+    format!(
+        "# By changing the setting below to TRUE you are indicating your agreement to the \
+         Minecraft EULA ({EULA_URL}).\n\
+         # Written by hopper.\n\
+         eula={accepted}\n"
+    )
+}
+
+/// Whether an existing `eula.txt` already accepts the agreement.
+///
+/// Tolerant of whatever the operator or a previous server run left behind: comments, blank
+/// lines, `TRUE`, and stray whitespace all appear in the wild.
+pub fn eula_accepted(contents: &str) -> bool {
+    contents.lines().any(|line| {
+        let line = line.trim();
+        if line.starts_with('#') {
+            return false;
+        }
+        line.split_once('=')
+            .is_some_and(|(k, v)| k.trim() == "eula" && v.trim().eq_ignore_ascii_case("true"))
+    })
+}
+
+/// A minimal `server.properties`, written only when none exists.
+///
+/// Seeded once and then never touched again: the operator's port, MOTD and difficulty are
+/// theirs, and a pack update has no business rewriting them.
+pub fn default_server_properties() -> String {
+    "# Minecraft server properties\n\
+     # Seeded by hopper on first install. hopper will not modify this file again.\n\
+     server-port=25565\n\
+     motd=A Minecraft Server\n\
+     online-mode=true\n\
+     max-players=20\n"
+        .to_owned()
+}
+
+/// Suggested heap size in gigabytes, derived from total system memory.
+///
+/// Leaves headroom for the OS and for the JVM's own non-heap usage, which is substantial for a
+/// modded server. Clamped at both ends: too small will not boot a large pack, and beyond about
+/// 12G garbage-collection pauses start hurting tick times more than the extra heap helps.
+pub fn suggested_heap_gb(total_memory_gb: u64) -> u64 {
+    total_memory_gb.saturating_sub(2).clamp(1, 12)
+}
+
+/// Contents of `jvm.args`.
+///
+/// This is the single knob an operator learns, whichever loader is in use. On Forge and
+/// NeoForge it replaces `user_jvm_args.txt` entirely — the installer's own file is left as
+/// shipped and simply not referenced.
+pub fn jvm_args_file(heap_gb: u64, detected_memory_gb: Option<u64>) -> String {
+    let detected = detected_memory_gb
+        .map(|gb| format!(" from {gb} GB detected"))
+        .unwrap_or_default();
+    format!(
+        "# JVM flags for this server. Yours to edit; hopper will not overwrite your changes.\n\
+         # hopper chose -Xmx{heap_gb}G{detected}.\n\
+         -Xms{heap_gb}G\n\
+         -Xmx{heap_gb}G\n\
+         -XX:+UseG1GC\n\
+         -XX:MaxGCPauseMillis=200\n\
+         -XX:+ParallelRefProcEnabled\n\
+         -XX:+AlwaysPreTouch\n\
+         -Dfile.encoding=UTF-8\n"
+    )
+}
+
+/// How the start script should find its JVM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JavaLocation {
+    /// A JVM hopper downloaded. The absolute path is baked in so the script works from cron,
+    /// systemd, and any shell with a minimal PATH.
+    Managed {
+        path: String,
+        vendor: JavaVendor,
+        major: u32,
+    },
+    /// One that was already installed.
+    System { path: String },
+}
+
+impl JavaLocation {
+    fn path(&self) -> &str {
+        match self {
+            Self::Managed { path, .. } | Self::System { path } => path,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::Managed { vendor, major, .. } => format!("{vendor} {major}, managed by hopper"),
+            Self::System { path } => format!("system JVM at {path}"),
+        }
+    }
+}
+
+/// Render `start.sh`.
+///
+/// `JAVA` is overridable from the environment so a systemd unit or container can inject a
+/// different JVM without regenerating anything, and the script `cd`s to its own directory so it
+/// runs correctly from anywhere.
+pub fn start_script(
+    launch: &LaunchProfile,
+    java: &JavaLocation,
+    jvm_args: Option<&RelPath>,
+    hopper_version: &str,
+) -> String {
+    let args = launch
+        .command_args(jvm_args, false)
+        .into_iter()
+        .map(|a| quote_sh(&a))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    format!(
+        "#!/usr/bin/env sh\n\
+         # Generated by hopper {hopper_version}. Managed file, regenerated on update.\n\
+         # Put JVM flags in jvm.args rather than editing this file.\n\
+         # If you do edit it, hopper notices and stops overwriting it.\n\
+         #\n\
+         # Java: {}\n\
+         set -eu\n\
+         cd \"$(dirname \"$0\")\"\n\
+         JAVA=\"${{JAVA:-{}}}\"\n\
+         exec \"$JAVA\" {args}\n",
+        java.describe(),
+        java.path(),
+    )
+}
+
+/// Single-quote a value for `sh`, so a path with a space cannot split into two arguments.
+fn quote_sh(s: &str) -> String {
+    if !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"@_-./:+=".contains(&b))
+    {
+        return s.to_owned();
+    }
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// A systemd unit the operator can paste.
+///
+/// Printed, never written: creating files under `/etc` is not something a modpack installer
+/// should do on its own.
+pub fn systemd_unit_hint(dir: &str, user: &str) -> String {
+    format!(
+        "[Unit]\n\
+         Description=Minecraft server ({dir})\n\
+         After=network.target\n\n\
+         [Service]\n\
+         Type=simple\n\
+         User={user}\n\
+         WorkingDirectory={dir}\n\
+         ExecStart={dir}/start.sh\n\
+         Restart=on-failure\n\n\
+         [Install]\n\
+         WantedBy=multi-user.target\n"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(s: &str) -> RelPath {
+        RelPath::parse(s).unwrap()
+    }
+
+    fn fabric_launch() -> LaunchProfile {
+        LaunchProfile::Classpath {
+            main_class: "net.fabricmc.loader.impl.launch.knot.KnotServer".into(),
+            classpath: vec![p("libraries/fabric-loader.jar"), p("server.jar")],
+            jvm_args: vec![],
+            program_args: vec!["nogui".into()],
+        }
+    }
+
+    fn neoforge_launch() -> LaunchProfile {
+        LaunchProfile::ArgFiles {
+            module_argfile_unix: p("libraries/net/neoforged/neoforge/21.1.95/unix_args.txt"),
+            module_argfile_windows: None,
+            program_args: vec!["nogui".into()],
+        }
+    }
+
+    fn managed_java() -> JavaLocation {
+        JavaLocation::Managed {
+            path: "/home/mc/.local/share/hopper/toolchains/graalvm-21-linux-x64/bin/java".into(),
+            vendor: JavaVendor::GraalVm,
+            major: 21,
+        }
+    }
+
+    #[test]
+    fn eula_file_records_the_decision_either_way() {
+        assert!(eula_file(true).contains("eula=true"));
+        assert!(eula_file(false).contains("eula=false"));
+        // The operator should be able to see what they agreed to.
+        assert!(eula_file(true).contains(EULA_URL));
+    }
+
+    #[test]
+    fn reads_acceptance_out_of_a_real_eula_file() {
+        assert!(eula_accepted(&eula_file(true)));
+        assert!(!eula_accepted(&eula_file(false)));
+    }
+
+    #[test]
+    fn tolerates_the_shapes_eula_files_actually_take() {
+        assert!(eula_accepted("eula=TRUE"));
+        assert!(eula_accepted("  eula = true  "));
+        assert!(eula_accepted("#comment\n\neula=True\n"));
+        assert!(!eula_accepted(""));
+        assert!(!eula_accepted("#eula=true"), "a comment is not acceptance");
+        assert!(!eula_accepted("eula=false"));
+        assert!(!eula_accepted("eulaa=true"));
+    }
+
+    #[test]
+    fn server_properties_are_seeded_with_sane_defaults() {
+        let p = default_server_properties();
+        assert!(p.contains("server-port=25565"));
+        // States plainly that it will not be touched again.
+        assert!(p.contains("will not modify"));
+    }
+
+    #[test]
+    fn heap_leaves_headroom_and_is_clamped_at_both_ends() {
+        assert_eq!(suggested_heap_gb(8), 6);
+        assert_eq!(
+            suggested_heap_gb(16),
+            12,
+            "capped where GC pauses start to hurt"
+        );
+        assert_eq!(suggested_heap_gb(64), 12);
+        assert_eq!(suggested_heap_gb(2), 1, "never zero");
+        assert_eq!(suggested_heap_gb(1), 1);
+        assert_eq!(suggested_heap_gb(0), 1);
+    }
+
+    #[test]
+    fn jvm_args_explain_where_the_number_came_from() {
+        let f = jvm_args_file(6, Some(8));
+        assert!(f.contains("-Xmx6G"));
+        assert!(f.contains("from 8 GB detected"), "no silent magic");
+        assert!(f.contains("hopper will not overwrite"));
+    }
+
+    #[test]
+    fn start_script_runs_from_anywhere_and_is_overridable() {
+        let s = start_script(
+            &fabric_launch(),
+            &managed_java(),
+            Some(&p("jvm.args")),
+            "0.1.0",
+        );
+        assert!(s.starts_with("#!/usr/bin/env sh"));
+        assert!(s.contains(r#"cd "$(dirname "$0")""#), "must work from cron");
+        assert!(
+            s.contains(r#"JAVA="${JAVA:-"#),
+            "must be overridable by systemd"
+        );
+        assert!(s.contains("set -eu"));
+        assert!(s.contains("exec "), "exec so signals reach the JVM");
+    }
+
+    #[test]
+    fn start_script_bakes_in_the_absolute_java_path() {
+        // A bare `java` would fail under cron or a minimal systemd PATH.
+        let s = start_script(&fabric_launch(), &managed_java(), None, "0.1.0");
+        assert!(s.contains("/toolchains/graalvm-21-linux-x64/bin/java"));
+    }
+
+    #[test]
+    fn the_same_script_shape_covers_every_loader() {
+        // The whole point: one command starts the server whatever the loader.
+        let fabric = start_script(
+            &fabric_launch(),
+            &managed_java(),
+            Some(&p("jvm.args")),
+            "0.1.0",
+        );
+        let neo = start_script(
+            &neoforge_launch(),
+            &managed_java(),
+            Some(&p("jvm.args")),
+            "0.1.0",
+        );
+
+        for s in [&fabric, &neo] {
+            assert!(s.contains("@jvm.args"), "jvm.args is the uniform knob");
+            assert!(s.contains("exec \"$JAVA\""));
+        }
+        // Only the tail differs.
+        assert!(fabric.contains("-cp"));
+        assert!(neo.contains("@libraries/net/neoforged/neoforge/21.1.95/unix_args.txt"));
+        assert!(!neo.contains("-cp"), "argfile loaders take no classpath");
+    }
+
+    #[test]
+    fn arguments_with_spaces_are_quoted() {
+        // A classpath entry or path containing a space must not split into two arguments.
+        let launch = LaunchProfile::Classpath {
+            main_class: "Main".into(),
+            classpath: vec![p("libraries/my mod.jar")],
+            jvm_args: vec![],
+            program_args: vec![],
+        };
+        let s = start_script(&launch, &managed_java(), None, "0.1.0");
+        assert!(s.contains("'libraries/my mod.jar'"), "got: {s}");
+    }
+
+    #[test]
+    fn quoting_handles_an_embedded_single_quote() {
+        assert_eq!(quote_sh("it's"), r"'it'\''s'");
+        // Ordinary arguments stay unquoted so the script remains readable.
+        assert_eq!(quote_sh("-cp"), "-cp");
+        assert_eq!(quote_sh("@jvm.args"), "@jvm.args");
+        assert_eq!(
+            quote_sh("libraries/a.jar:server.jar"),
+            "libraries/a.jar:server.jar"
+        );
+    }
+
+    #[test]
+    fn a_system_jvm_is_described_honestly() {
+        let s = start_script(
+            &fabric_launch(),
+            &JavaLocation::System {
+                path: "/usr/bin/java".into(),
+            },
+            None,
+            "0.1.0",
+        );
+        assert!(s.contains("system JVM at /usr/bin/java"));
+    }
+
+    #[test]
+    fn the_systemd_unit_points_at_the_start_script() {
+        let u = systemd_unit_hint("/srv/mc", "mc");
+        assert!(u.contains("ExecStart=/srv/mc/start.sh"));
+        assert!(u.contains("WorkingDirectory=/srv/mc"));
+        assert!(u.contains("Restart=on-failure"));
+        assert!(u.contains("User=mc"));
+    }
+}

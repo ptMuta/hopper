@@ -13,6 +13,7 @@ pub mod loader;
 pub mod model;
 pub mod net;
 pub mod plan;
+pub mod server;
 pub mod source;
 
 pub use model::{

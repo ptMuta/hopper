@@ -22,6 +22,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream", "json", "gzip"] }
 async-trait = "0.1"
 quick-xml = "0.37"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
 futures = "0.3"
 
 [profile.release]

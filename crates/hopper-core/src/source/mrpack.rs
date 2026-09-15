@@ -357,6 +357,55 @@ pub struct Mrpack {
     pub overrides: Vec<OverrideEntry>,
 }
 
+/// Extract override content into a content store, returning each file's digest and size.
+///
+/// Overrides live inside the archive rather than behind a URL, so they have to be staged into
+/// the store before anything can be planned against them — the planner works in digests, and
+/// apply materialises from the store. Content is re-validated on the way in, and the
+/// decompression limits apply here too, since the sizes a ZIP header declares are a claim
+/// rather than a fact.
+pub fn stage_overrides<R: Read + Seek>(
+    reader: R,
+    entries: &[OverrideEntry],
+    store: &crate::cache::BlobStore,
+) -> Result<std::collections::BTreeMap<RelPath, (crate::model::Digest, u64)>, MrpackError> {
+    use std::collections::BTreeMap;
+
+    let mut zip = zip::ZipArchive::new(reader).map_err(|e| MrpackError::Archive(e.to_string()))?;
+    let mut out: BTreeMap<RelPath, (crate::model::Digest, u64)> = BTreeMap::new();
+    let mut total: u64 = 0;
+
+    // `entries` is ordered global-then-server, so a later insert at the same path replaces an
+    // earlier one -- which is exactly how server-overrides is meant to win.
+    for entry in entries {
+        let mut file = zip
+            .by_name(&entry.zip_name)
+            .map_err(|e| MrpackError::Archive(e.to_string()))?;
+
+        let mut buf = Vec::new();
+        file.by_ref()
+            .take(MAX_ENTRY_BYTES + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| MrpackError::Io(e.to_string()))?;
+        if buf.len() as u64 > MAX_ENTRY_BYTES {
+            return Err(MrpackError::EntryTooLarge {
+                path: entry.zip_name.clone(),
+                limit: MAX_ENTRY_BYTES,
+            });
+        }
+        total = total.saturating_add(buf.len() as u64);
+        if total > MAX_TOTAL_BYTES {
+            return Err(MrpackError::TotalTooLarge(MAX_TOTAL_BYTES));
+        }
+
+        let blob = store
+            .insert_bytes(&buf, None)
+            .map_err(|e| MrpackError::Io(e.to_string()))?;
+        out.insert(entry.path.clone(), (blob.digest, blob.size));
+    }
+    Ok(out)
+}
+
 /// Read and validate a `.mrpack` archive.
 pub fn read<R: Read + Seek>(reader: R, allow: &HostAllowlist) -> Result<Mrpack, MrpackError> {
     let mut zip = zip::ZipArchive::new(reader).map_err(|e| MrpackError::Archive(e.to_string()))?;

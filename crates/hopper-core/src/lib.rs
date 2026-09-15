@@ -4,6 +4,7 @@
 //! everything. See `hopper::model::path::RelPath` for the untrusted-input boundary and
 //! (once landed) `plan::reconcile` for the three-way reconcile that is the product's point.
 
+pub mod api;
 pub mod apply;
 pub mod model;
 pub mod net;

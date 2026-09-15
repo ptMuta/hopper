@@ -18,6 +18,10 @@ sha2 = "0.10"
 hex = "0.4"
 url = { version = "2", features = ["serde"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "time", "sync", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream", "json", "gzip"] }
+async-trait = "0.1"
+futures = "0.3"
 
 [profile.release]
 lto = true

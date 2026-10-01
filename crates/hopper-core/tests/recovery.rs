@@ -73,6 +73,7 @@ fn lockfile(files: Vec<LockedFile>) -> Lockfile {
             loader: LoaderKind::Fabric,
             loader_version: "0.17.2".into(),
             java_major: 25,
+            start_script: None,
         },
         pack: PackRecord {
             name: "Test".into(),

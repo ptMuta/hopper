@@ -59,15 +59,23 @@ pub const RUNTIME_HOSTS: &[&str] = &[
     "download.oracle.com",
     "api.adoptium.net",
     "github.com",
-    // GitHub's release downloads redirect here; it replaced objects.githubusercontent.com,
-    // which is kept for older links.
-    "release-assets.githubusercontent.com",
-    "objects.githubusercontent.com",
 ];
 
 /// Registry API hosts. Separate from [`PACK_HOSTS`] because an API that tells us what to
 /// download is a different concern from the hosts we will download from.
 pub const API_HOSTS: &[&str] = &["api.modrinth.com", "staging-api.modrinth.com"];
+
+/// Hosts reachable only as a redirect from a specific host, never as a URL a pack declares.
+///
+/// GitHub serves `github.com/<repo>/releases/download/...` by redirecting to its asset host.
+/// That host serves only release assets, which `github.com` already denotes, so following the
+/// redirect widens nothing. Accepting it as a declared URL would go beyond Modrinth's published
+/// list, so it is not.
+pub const REDIRECT_TARGETS: &[(&str, &str)] = &[
+    ("github.com", "release-assets.githubusercontent.com"),
+    // Where GitHub redirected before release-assets existed; older links may still go here.
+    ("github.com", "objects.githubusercontent.com"),
+];
 
 /// CurseForge's API. Alone in its own list because requests to it carry the operator's API key,
 /// and a key-bearing client must not be able to follow a redirect anywhere else.
@@ -80,22 +88,24 @@ pub const CURSEFORGE_CDN_HOSTS: &[&str] = &["edge.forgecdn.net", "mediafilez.for
 pub struct HostAllowlist {
     domain: &'static str,
     hosts: Vec<String>,
+    /// `(from, to)`: `to` is allowed only as a redirect hop out of `from`.
+    redirects: Vec<(String, String)>,
 }
 
 impl HostAllowlist {
     pub fn packs() -> Self {
-        Self::new("pack downloads", PACK_HOSTS)
+        Self::new("pack downloads", PACK_HOSTS).with_redirects(REDIRECT_TARGETS)
     }
 
     pub fn runtimes() -> Self {
-        Self::new("runtime downloads", RUNTIME_HOSTS)
+        Self::new("runtime downloads", RUNTIME_HOSTS).with_redirects(REDIRECT_TARGETS)
     }
 
     /// API calls plus the CDN they hand out URLs for.
     pub fn api() -> Self {
         let mut hosts: Vec<&str> = API_HOSTS.to_vec();
         hosts.extend_from_slice(PACK_HOSTS);
-        Self::new("registry API", &hosts)
+        Self::new("registry API", &hosts).with_redirects(REDIRECT_TARGETS)
     }
 
     /// CurseForge's API host and nothing else. See [`CURSEFORGE_API_HOSTS`].
@@ -112,6 +122,40 @@ impl HostAllowlist {
         Self {
             domain,
             hosts: hosts.iter().map(|h| h.to_ascii_lowercase()).collect(),
+            redirects: Vec::new(),
+        }
+    }
+
+    /// Permit redirect-only targets. A pair applies only when its `from` host is itself on
+    /// this list, so a target never becomes reachable from a host this list does not trust.
+    pub fn with_redirects(mut self, pairs: &[(&str, &str)]) -> Self {
+        for (from, to) in pairs {
+            let from = from.to_ascii_lowercase();
+            if self.hosts.contains(&from) {
+                self.redirects.push((from, to.to_ascii_lowercase()));
+            }
+        }
+        self
+    }
+
+    /// Check one redirect hop: `to` must be allowed outright, or be a redirect-only target of
+    /// the host that sent the redirect.
+    pub fn check_redirect(&self, from: &Url, to: &Url) -> Result<(), HostError> {
+        let err = match self.check(to) {
+            Ok(()) => return Ok(()),
+            Err(e @ HostError::NotAllowed { .. }) => e,
+            Err(other) => return Err(other),
+        };
+        let from_host = from.host_str().unwrap_or_default().to_ascii_lowercase();
+        let to_host = to.host_str().unwrap_or_default().to_ascii_lowercase();
+        if self
+            .redirects
+            .iter()
+            .any(|(f, t)| *f == from_host && *t == to_host)
+        {
+            Ok(())
+        } else {
+            Err(err)
         }
     }
 
@@ -160,6 +204,51 @@ mod tests {
 
     fn u(s: &str) -> Url {
         Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn github_asset_hosts_are_reachable_only_by_redirect_from_github() {
+        let gh = u("https://github.com/o/r/releases/download/v1/mod.jar");
+        let asset = u(
+            "https://release-assets.githubusercontent.com/github-production-release-asset/1?sig=x",
+        );
+        let old =
+            u("https://objects.githubusercontent.com/github-production-release-asset-2e65be/1");
+
+        for a in [
+            HostAllowlist::packs(),
+            HostAllowlist::runtimes(),
+            HostAllowlist::api(),
+        ] {
+            // Never as a declared URL.
+            assert!(a.check(&asset).is_err());
+            assert!(a.check(&old).is_err());
+            // Only as a hop out of github.com.
+            assert!(a.check_redirect(&gh, &asset).is_ok());
+            assert!(a.check_redirect(&gh, &old).is_ok());
+            assert!(
+                a.check_redirect(&u("https://cdn.modrinth.com/x"), &asset)
+                    .is_err(),
+                "a redirect from anywhere else does not qualify"
+            );
+            // A redirect never loosens https or the credential check.
+            assert!(
+                a.check_redirect(&gh, &u("http://release-assets.githubusercontent.com/x"))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn a_redirect_pair_needs_its_source_host_on_the_list() {
+        let a = HostAllowlist::curseforge_api().with_redirects(REDIRECT_TARGETS);
+        assert!(
+            a.check_redirect(
+                &u("https://github.com/x"),
+                &u("https://release-assets.githubusercontent.com/x")
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -26,6 +26,9 @@ pub struct Runtime {
     pub launch: LaunchProfile,
     pub java_major: u32,
     pub loader_version: String,
+    /// The loader's installer has never run for this build, and this run may not run it
+    /// (a dry run). `files` and `launch` are then placeholders.
+    pub installer_pending: bool,
 }
 
 /// The vanilla server jar's path inside the server directory.
@@ -64,6 +67,8 @@ pub struct LoaderEnv<'a> {
     /// Where installer runs are staged and remembered between invocations.
     pub cache_root: &'a std::path::Path,
     pub quiet: bool,
+    /// False for a dry run: third-party installer code is not run just to show a plan.
+    pub run_installer: bool,
 }
 
 /// Resolve the loader into installable files plus a launch profile.
@@ -90,6 +95,7 @@ pub async fn resolve_loader(
             },
             java_major: release.java_major,
             loader_version: String::new(),
+            installer_pending: false,
         }),
         LoaderKind::Fabric => {
             let mut files = vec![vanilla_jar(client, store, mc, release).await?];
@@ -139,13 +145,27 @@ pub async fn resolve_loader(
                 launch: server.launch,
                 java_major: release.java_major,
                 loader_version: version,
+                installer_pending: false,
             })
         }
         // The installer fetches its own copy of the vanilla jar into libraries/, so ours would
         // only be a second, unused copy.
         LoaderKind::Forge | LoaderKind::NeoForge => {
             let version = installer_build(client, loader, loader_version, mc).await?;
-            let record = installed_build(client, store, loader, mc, &version, env).await?;
+            let Some(record) = installed_build(client, store, loader, mc, &version, env).await?
+            else {
+                return Ok(Runtime {
+                    files: vec![],
+                    launch: LaunchProfile::ExecutableJar {
+                        jar: server_jar_path(),
+                        jvm_args: vec![],
+                        program_args: vec![],
+                    },
+                    java_major: release.java_major,
+                    loader_version: version,
+                    installer_pending: true,
+                });
+            };
             let files = record
                 .files
                 .into_iter()
@@ -166,6 +186,7 @@ pub async fn resolve_loader(
                 launch: record.launch,
                 java_major: release.java_major,
                 loader_version: version,
+                installer_pending: false,
             })
         }
         LoaderKind::Quilt => bail!(
@@ -224,12 +245,22 @@ async fn installer_build(
             .map(str::to_owned)
             .ok_or_else(|| versions::VersionError::NoForgeBuild(mc.clone()).into());
     }
+    // NeoForge's first release, for 1.20.1, lives under Forge's old artifact name.
+    let legacy = mc.as_str() == "1.20.1";
     let body = client
-        .get_bytes(versions::NEOFORGE_MAVEN_METADATA)
+        .get_bytes(if legacy {
+            versions::NEOFORGE_LEGACY_MAVEN_METADATA
+        } else {
+            versions::NEOFORGE_MAVEN_METADATA
+        })
         .await
         .context("listing NeoForge builds")?;
     let all = versions::parse_maven_metadata(&body)?;
-    let candidates = neoforge_versions_for(&all, mc);
+    let candidates = if legacy {
+        versions::neoforge_legacy_versions(&all)
+    } else {
+        neoforge_versions_for(&all, mc)
+    };
     installer::choose_neoforge(&candidates)
         .map(str::to_owned)
         .ok_or_else(|| versions::VersionError::NoNeoForgeBuild(mc.clone()).into())
@@ -243,8 +274,8 @@ async fn installed_build(
     mc: &MinecraftVersion,
     version: &str,
     env: &LoaderEnv<'_>,
-) -> Result<installer::InstallRecord> {
-    let staging = installer::staging_dir(env.cache_root, loader, mc, version);
+) -> Result<Option<installer::InstallRecord>> {
+    let staging = installer::staging_dir(env.cache_root, loader, mc, version)?;
     let record_path = staging.join(installer::RECORD_FILE);
 
     // A complete earlier run whose blobs are all still in the store needs nothing more.
@@ -252,7 +283,10 @@ async fn installed_build(
         && let Some(record) = installer::InstallRecord::from_json(&bytes)
         && record.files.iter().all(|f| store.contains(&f.content))
     {
-        return Ok(record);
+        return Ok(Some(record));
+    }
+    if !env.run_installer {
+        return Ok(None);
     }
 
     let Some(java) = env.java else {
@@ -294,6 +328,8 @@ async fn installed_build(
         .arg("--installServer")
         .arg(&work)
         .current_dir(&work)
+        // The installer is third-party code and has no use for the operator's API key.
+        .env_remove(crate::curseforge::KEY_ENV)
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
@@ -327,7 +363,7 @@ async fn installed_build(
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::rename(&work, &staging)
         .with_context(|| format!("publishing the installer output to {}", staging.display()))?;
-    Ok(record)
+    Ok(Some(record))
 }
 
 /// Decide what to do about Java, without downloading anything yet.
@@ -379,6 +415,16 @@ fn discover_system_java() -> Vec<hopper_core::java::SystemJava> {
         if !path.is_empty() {
             candidates.push(std::path::PathBuf::from(path));
         }
+    }
+    // JVMs hopper provisioned earlier, so a second run uses them rather than reporting that
+    // none was found and then "installing" the one already there.
+    if let Ok(entries) = data_dir().and_then(|d| Ok(std::fs::read_dir(d.join("toolchains"))?)) {
+        candidates.extend(
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path().join("bin/java"))
+                .filter(|p| p.exists()),
+        );
     }
     if let Ok(entries) = std::fs::read_dir("/usr/lib/jvm") {
         candidates.extend(

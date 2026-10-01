@@ -111,6 +111,9 @@ pub fn read_server_pack<R: Read + Seek>(reader: R) -> Result<ServerPack, PackErr
             continue;
         }
         let name = entry.name().to_owned();
+        if is_debris(&name) {
+            continue;
+        }
         let rest = match &wrapper {
             Some(w) => name.strip_prefix(w.as_str()).unwrap_or(&name),
             None => &name,
@@ -159,21 +162,42 @@ fn parse_path(zip_name: &str, rest: &str) -> Result<RelPath, MrpackError> {
     })
 }
 
+/// Folder names that are server content in their own right, never a wrapper.
+const CONTENT_DIRS: &[&str] = &[
+    "mods",
+    "config",
+    "defaultconfigs",
+    "kubejs",
+    "scripts",
+    "resourcepacks",
+    "datapacks",
+    "libraries",
+    "plugins",
+];
+
+/// Archive debris that is never server content: macOS resource forks and the like.
+fn is_debris(name: &str) -> bool {
+    name.starts_with("__MACOSX/") || name.ends_with("/.DS_Store") || name == ".DS_Store"
+}
+
 /// The single folder a server pack was zipped from, if it was zipped that way.
 ///
-/// Only stripped when it plainly is a wrapper: everything is inside it, and it holds a `mods/`
-/// folder. A pack that ships nothing but `config/` must not lose that folder name.
+/// Stripped when every entry is inside one folder that is not itself a content folder. A pack
+/// that ships nothing but `config/` keeps that folder name.
 fn wrapper_dir(names: &[String]) -> Option<String> {
-    let first = names
-        .iter()
-        .find_map(|n| n.split_once('/').map(|(d, _)| d))?;
+    let mut real = names.iter().filter(|n| !is_debris(n));
+    let first = real.next()?.split_once('/')?.0.to_owned();
+    // `..` or `.` is not a folder anyone zipped from; stripping it would quietly turn a hostile
+    // path into an innocent one instead of refusing it.
+    if CONTENT_DIRS.contains(&first.as_str()) || RelPath::parse(&first).is_err() {
+        return None;
+    }
     let prefix = format!("{first}/");
-    let all_inside = names.iter().all(|n| n.starts_with(&prefix));
-    let has_mods = names.iter().any(|n| {
-        n.strip_prefix(&prefix)
-            .is_some_and(|rest| rest.starts_with("mods/"))
-    });
-    (all_inside && has_mods).then_some(prefix)
+    names
+        .iter()
+        .filter(|n| !is_debris(n))
+        .all(|n| n.starts_with(&prefix))
+        .then_some(prefix)
 }
 
 /// Whether a server-pack entry is something hopper provides or must never write.
@@ -299,6 +323,17 @@ mod tests {
         assert_eq!(sp.dropped, ["startserver.sh"]);
         // The zip name still points at the real entry for extraction.
         assert!(sp.entries[0].zip_name.starts_with("Pack Server 1.0/"));
+    }
+
+    #[test]
+    fn a_wrapper_is_stripped_despite_macos_debris_and_without_mods() {
+        let sp = read_server_pack(build_zip(&[
+            ("Pack Server/config/a.toml", b"a"),
+            ("Pack Server/kubejs/b.js", b"b"),
+            ("__MACOSX/Pack Server/._a.toml", b"x"),
+        ]))
+        .unwrap();
+        assert_eq!(kept(&sp), ["config/a.toml", "kubejs/b.js"]);
     }
 
     #[test]

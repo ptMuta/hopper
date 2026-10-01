@@ -366,3 +366,101 @@ fn the_curseforge_key_never_appears_in_output() {
     assert_ne!(out.status.code(), Some(0));
     assert!(!all.contains("do-not-print-me"), "{all}");
 }
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_directory_is_never_written_through() {
+    // An operator who points config/ at shared storage must not have hopper write into it,
+    // and nothing the pack ships may land outside the server directory.
+    let s = Server::new();
+    let elsewhere = s.dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::create_dir_all(s.root()).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, s.root().join("config")).unwrap();
+
+    let pack = s.dir.path().join("p.mrpack");
+    build_pack(
+        &pack,
+        "1.0.0",
+        &[
+            ("overrides/config/a.toml", "a = 1\n"),
+            ("overrides/kubejs/b.js", "b\n"),
+        ],
+    );
+    let (out, err, _) = s.install(&pack, &["--yes"]);
+
+    assert!(
+        std::fs::read_dir(&elsewhere).unwrap().next().is_none(),
+        "wrote through the symlink:\n{out}{err}"
+    );
+    assert!(
+        s.exists("kubejs/b.js"),
+        "unrelated files still install:\n{out}{err}"
+    );
+    assert!(out.contains("refused"), "the refusal is reported:\n{out}");
+}
+
+#[test]
+fn a_pack_cannot_install_access_lists() {
+    // An author's ops.json would make them an operator on every server installing the pack.
+    let s = Server::new();
+    let pack = s.dir.path().join("p.mrpack");
+    build_pack(
+        &pack,
+        "1.0.0",
+        &[
+            ("overrides/ops.json", "[{\"name\":\"author\",\"level\":4}]"),
+            ("server-overrides/whitelist.json", "[]"),
+            ("overrides/config/a.toml", "a = 1\n"),
+        ],
+    );
+    let (out, err, code) = s.install(&pack, &["--yes"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(!s.exists("ops.json"), "{out}");
+    assert!(!s.exists("whitelist.json"), "{out}");
+    assert!(s.exists("config/a.toml"));
+    assert!(
+        out.contains("access lists"),
+        "the refusal is reported:\n{out}"
+    );
+}
+
+#[test]
+fn force_exclude_applies_to_override_files_and_is_remembered() {
+    // Server packs ship every mod as an override; an exclusion that skipped those would do
+    // nothing. And a bare `hopper` from cron must not reinstall what the operator removed.
+    let s = Server::new();
+    let pack = s.dir.path().join("p.mrpack");
+    build_pack(
+        &pack,
+        "1.0.0",
+        &[
+            ("overrides/mods/keep.jar", "keep"),
+            ("overrides/mods/crashes-server.jar", "bad"),
+        ],
+    );
+    let (out, err, code) = s.install(&pack, &["--yes", "--force-exclude", "crashes-server"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(s.exists("mods/keep.jar"));
+    assert!(!s.exists("mods/crashes-server.jar"), "{out}");
+
+    let (out, err, code) = s.run(&["--mods-only", "--yes"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(
+        !s.exists("mods/crashes-server.jar"),
+        "reinstalled on update:\n{out}"
+    );
+    assert!(
+        out.contains("Remembered: --force-exclude crashes-server"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_version_given_twice_is_refused() {
+    let s = Server::new();
+    std::fs::create_dir_all(s.root()).unwrap();
+    let (_, err, code) = s.run(&["adrenaserver@1.0", "2.0", "--mods-only", "--yes"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("given twice"), "{err}");
+}

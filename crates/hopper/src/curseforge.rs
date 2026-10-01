@@ -29,10 +29,15 @@ pub struct Options<'a> {
     pub api_key: Option<&'a str>,
     pub user_agent: &'a str,
     pub mc: Option<&'a MinecraftVersion>,
-    /// The operator already chose the client-pack route on an earlier run.
+    /// The CurseForge project this directory already has installed, if any. Choices remembered
+    /// from earlier runs apply only to that project, never to a different pack.
+    pub installed_project: Option<&'a str>,
+    /// Remembered: the operator accepted the client-pack route for the installed project.
     pub fallback_accepted: bool,
     pub allow_client_pack: bool,
     pub skip_blocked: bool,
+    /// Remembered: the operator chose to go without blocked files for the installed project.
+    pub skip_blocked_remembered: bool,
     pub yes: bool,
     pub dry_run: bool,
     pub quiet: bool,
@@ -46,6 +51,8 @@ pub struct Resolved {
     pub file_id: String,
     /// Built from the client pack because no server pack exists.
     pub client_pack_fallback: bool,
+    /// Blocked files were left out with the operator's consent.
+    pub skipped_blocked: bool,
 }
 
 pub enum Outcome {
@@ -101,6 +108,9 @@ pub async fn resolve(
         .await
         .with_context(|| format!("listing files of {slug:?}"))?;
     let chosen = cf::choose_file(&files, slug, version, opts.mc)?;
+    let same_project = opts.installed_project == Some(project.id.to_string().as_str());
+    let fallback_accepted = same_project && opts.fallback_accepted;
+    let skip_blocked = opts.skip_blocked || (same_project && opts.skip_blocked_remembered);
 
     if !opts.quiet && chosen.release().is_some_and(|r| r != ReleaseType::Release) {
         println!(
@@ -138,7 +148,7 @@ pub async fn resolve(
     };
 
     if let Some(server_pack_id) = chosen.server_pack() {
-        if opts.fallback_accepted && !opts.quiet {
+        if fallback_accepted && !opts.quiet {
             println!(
                 "note: {} now publishes a server pack; switching to it",
                 project.name
@@ -176,6 +186,7 @@ pub async fn resolve(
             project_id: project.id.to_string(),
             file_id: chosen.id.to_string(),
             client_pack_fallback: false,
+            skipped_blocked: false,
         })));
     }
 
@@ -191,12 +202,17 @@ pub async fn resolve(
     eprintln!("         fails to start, --force-exclude <name> removes a mod and -v shows why");
     eprintln!("         each one was kept or skipped.\n");
 
-    let proceed = if opts.fallback_accepted || opts.allow_client_pack || opts.dry_run {
+    let proceed = if fallback_accepted || opts.allow_client_pack {
         true
-    } else if opts.yes {
+    } else if opts.dry_run {
+        // Shown, so the plan is visible, but a real run will not apply it on its own.
+        eprintln!("note: a real run will ask before building from the client pack; unattended,");
+        eprintln!("      pass --allow-client-pack.\n");
+        true
+    } else if opts.yes || !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         // --yes means "no prompts", not "agree to a different kind of install".
-        eprintln!("help: --yes does not accept this on its own. Re-run with --allow-client-pack");
-        eprintln!("      to build from the client pack unattended.");
+        eprintln!("help: this needs an explicit yes. Re-run with --allow-client-pack to build");
+        eprintln!("      from the client pack unattended.");
         false
     } else {
         confirm("Build the server from the client pack?")?
@@ -205,7 +221,8 @@ pub async fn resolve(
         return Ok(Outcome::Declined);
     }
 
-    let built = build_from_manifest(&api, &cdn, store, &client_pack, opts).await?;
+    let (built, skipped_blocked) =
+        build_from_manifest(&api, &cdn, store, &client_pack, skip_blocked, opts.quiet).await?;
     let overrides = stage_overrides(open(&client_blob)?, &client_pack.overrides, store)
         .context("extracting the pack's config files")?;
     Ok(Outcome::Resolved(Box::new(Resolved {
@@ -218,6 +235,7 @@ pub async fn resolve(
         project_id: project.id.to_string(),
         file_id: chosen.id.to_string(),
         client_pack_fallback: true,
+        skipped_blocked,
     })))
 }
 
@@ -227,8 +245,9 @@ async fn build_from_manifest(
     cdn: &HttpClient,
     store: &BlobStore,
     pack: &ClientPack,
-    opts: &Options<'_>,
-) -> Result<Vec<IndexFile>> {
+    skip_blocked: bool,
+    quiet: bool,
+) -> Result<(Vec<IndexFile>, bool)> {
     let wanted = &pack.manifest.files;
     let file_ids: Vec<u64> = wanted.iter().map(|f| f.file_id).collect();
     let mut project_ids: Vec<u64> = wanted.iter().map(|f| f.project_id).collect();
@@ -248,10 +267,21 @@ async fn build_from_manifest(
         .map(|m| (m.id, m))
         .collect();
 
-    let mut out = Vec::new();
+    let mut out: Vec<IndexFile> = Vec::new();
     let mut blocked = Vec::new();
+    let mut not_placed = Vec::new();
+    let mut seen: BTreeMap<RelPath, u64> = BTreeMap::new();
     for entry in wanted {
         let Some(file) = files.get(&entry.file_id) else {
+            if !entry.required {
+                if !quiet {
+                    println!(
+                        "note: optional file {} of project {} no longer exists on CurseForge; skipped",
+                        entry.file_id, entry.project_id
+                    );
+                }
+                continue;
+            }
             bail!(
                 "CurseForge no longer has file {} of project {}, which the pack requires",
                 entry.file_id,
@@ -260,11 +290,24 @@ async fn build_from_manifest(
         };
         let project = projects.get(&entry.project_id);
         let Some(dir) = cf::dir_for_class(project.and_then(|p| p.class_id)) else {
+            not_placed
+                .push(project.map_or_else(|| entry.project_id.to_string(), |p| p.name.clone()));
             continue;
         };
         let path = RelPath::parse(&format!("{dir}/{}", file.file_name)).with_context(|| {
             format!("CurseForge file {:?} has an unusable name", file.file_name)
         })?;
+        // Two projects shipping the same file name would silently replace one another.
+        if let Some(other) = seen.insert(path.clone(), file.id) {
+            if other == file.id {
+                continue;
+            }
+            bail!(
+                "the pack lists two different files that both install as {path} \
+                 (CurseForge files {other} and {})",
+                file.id
+            );
+        }
 
         let (client_tag, server_tag) = file.environment_tags();
         let env = match (client_tag, server_tag) {
@@ -322,8 +365,8 @@ async fn build_from_manifest(
                 format!("  - {path}  ({page})")
             })
             .collect();
-        if opts.skip_blocked {
-            if !opts.quiet {
+        if skip_blocked {
+            if !quiet {
                 println!(
                     "note: {} file(s) cannot be downloaded by third-party tools and were left out:",
                     blocked.len()
@@ -351,7 +394,14 @@ async fn build_from_manifest(
             bail!("the pack includes files that cannot be downloaded automatically");
         }
     }
-    Ok(out)
+    if !not_placed.is_empty() && !quiet {
+        println!(
+            "note: {} project(s) are not mods, resource packs or shaders and were not installed: {}",
+            not_placed.len(),
+            not_placed.join(", ")
+        );
+    }
+    Ok((out, !blocked.is_empty()))
 }
 
 fn placeholder(id: u64) -> WireMod {

@@ -105,6 +105,11 @@ pub fn fsync_dir(path: &Path) -> Result<()> {
 
 /// Write bytes so that readers see either the old file or the new one, never a partial write.
 pub fn write_atomic(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
+    write_atomic_from(path, &mut &bytes[..], executable)
+}
+
+/// [`write_atomic`], streaming from a reader rather than holding the content in memory.
+pub fn write_atomic_from<R: io::Read>(path: &Path, reader: &mut R, executable: bool) -> Result<()> {
     let parent = path.parent().unwrap_or(Path::new("."));
     create_dir_all(parent)?;
 
@@ -112,7 +117,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
     let tmp = temp_sibling(path);
     {
         let mut f = at("create", &tmp, fs::File::create(&tmp))?;
-        at("write", &tmp, f.write_all(bytes))?;
+        at("write", &tmp, io::copy(reader, &mut f).map(drop))?;
         at("flush", &tmp, f.flush())?;
         set_executable(&f, &tmp, executable)?;
         // Durable before it is visible: a rename of an unsynced file can survive while its

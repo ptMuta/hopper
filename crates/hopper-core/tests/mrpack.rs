@@ -153,6 +153,21 @@ fn env_server_unsupported_is_an_explicit_no() {
 }
 
 #[test]
+fn an_env_value_hopper_does_not_know_says_nothing_rather_than_breaking_the_pack() {
+    // Current Modrinth packs write "unknown". Refusing the whole pack over one value would make
+    // it uninstallable; reading it as yes or no would be a guess.
+    let files = serde_json::json!([{
+        "path": "mods/a.jar",
+        "hashes": { "sha512": SHA512_A },
+        "downloads": ["https://cdn.modrinth.com/a.jar"],
+        "env": { "client": "required", "server": "unknown" },
+    }]);
+    let idx = MrpackIndex::parse(&index_json(files, fabric_deps()), &allow()).unwrap();
+    assert_eq!(idx.files[0].wanted_on_server(), None);
+    assert!(!idx.files[0].is_optional_on_server());
+}
+
+#[test]
 fn env_server_optional_is_wanted_but_flagged_optional() {
     let files = serde_json::json!([{
         "path": "mods/a.jar",

@@ -40,6 +40,17 @@ pub struct Resolved {
     pub skipped: Vec<Classified>,
     /// Installed, but with at least one signal arguing against it.
     pub uncertain: Vec<Classified>,
+    /// Server access lists the pack tried to ship, which are never installed.
+    pub access_lists: Vec<RelPath>,
+}
+
+/// Files that decide who can join or administer the server.
+///
+/// A pack shipping its author's `ops.json` would make the author an operator on every server
+/// that installs it. These are the operator's alone, whatever the pack says, so they are never
+/// installed from a pack -- not even onto a fresh directory where nothing would be overwritten.
+pub fn is_access_list(path: &RelPath) -> bool {
+    crate::plan::reconcile::PROTECTED_FILES.contains(&path.as_str())
 }
 
 impl Resolved {
@@ -74,6 +85,7 @@ fn pack_env_signal(file: &IndexFile) -> Option<EnvSignal> {
         EnvSupport::Unsupported => EnvClaim::ServerUnsupported,
         EnvSupport::Optional => EnvClaim::ServerOptional,
         EnvSupport::Required => EnvClaim::ServerRequired,
+        EnvSupport::Unknown => return None,
     };
     Some(EnvSignal::new(
         EnvSource::PackEnv,
@@ -102,6 +114,10 @@ pub fn resolve_for_server(
     let mut out = Resolved::default();
 
     for file in &pack.index.files {
+        if is_access_list(&file.path) {
+            out.access_lists.push(file.path.clone());
+            continue;
+        }
         let mut signals = Vec::new();
 
         if let Some(ov) = overrides(&file.path) {
@@ -144,8 +160,27 @@ pub fn resolve_for_server(
     // inserted later. client-overrides never reach here at all.
     for entry in &pack.overrides {
         debug_assert_ne!(entry.kind, OverrideKind::Client);
-        if !path_signals(&entry.path).is_empty() {
+        if is_access_list(&entry.path) {
+            out.access_lists.push(entry.path.clone());
             continue;
+        }
+        // The operator's rules apply to override files too. A server pack ships every mod as
+        // one, so without this --force-exclude could not remove anything from it.
+        match overrides(&entry.path) {
+            Some(Override::Exclude) => {
+                out.skipped.push(Classified {
+                    path: entry.path.clone(),
+                    outcome: decide(&[EnvSignal::new(
+                        EnvSource::UserRule,
+                        EnvClaim::ServerUnsupported,
+                        "set by you",
+                    )]),
+                });
+                continue;
+            }
+            Some(Override::Include) => {}
+            None if !path_signals(&entry.path).is_empty() => continue,
+            None => {}
         }
         // Content was staged out of the archive; an entry with none was not extracted and
         // must not be planned, or apply would look for a blob that does not exist.

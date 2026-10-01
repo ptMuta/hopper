@@ -12,7 +12,7 @@ name = "hopper"
 path = "src/main.rs"
 
 [dependencies]
-hopper-core = { path = "../hopper-core", version = "0.1.0" }
+hopper-core = { path = "../hopper-core", version = "0.1.1" }
 clap.workspace = true
 anyhow.workspace = true
 tokio.workspace = true

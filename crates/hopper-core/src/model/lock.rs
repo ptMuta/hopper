@@ -222,6 +222,9 @@ pub struct ServerRecord {
     pub loader: LoaderKind,
     pub loader_version: String,
     pub java_major: u32,
+    /// What hopper last wrote to `start.sh`, so an operator's edit is noticed and kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_script: Option<Digest>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,6 +261,9 @@ pub struct PolicyRecord {
     /// client pack. Remembered so an update does not ask again.
     #[serde(default, skip_serializing_if = "is_false")]
     pub client_pack_fallback: bool,
+    /// The operator chose to go without files whose authors block third-party downloads.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skip_blocked: bool,
 }
 
 impl Lockfile {
@@ -391,6 +397,7 @@ mod tests {
                 loader: LoaderKind::Fabric,
                 loader_version: "0.17.2".into(),
                 java_major: 25,
+                start_script: None,
             },
             pack: PackRecord {
                 name: "Test Pack".into(),

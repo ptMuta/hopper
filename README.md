@@ -37,6 +37,7 @@ Every update restates how many of your own files it left alone.
   default, `--java-vendor adoptium` otherwise) when nothing suitable is installed.
 - Writes a `start.sh` that works the same whatever the loader, and a `jvm.args` that is yours to
   edit. On Forge and NeoForge this replaces `user_jvm_args.txt`, so there is one knob to learn.
+  Edit `start.sh` and hopper stops regenerating it, writing `start.sh.new` beside it instead.
 - **Keeps client-only mods off your server.** Pack metadata is frequently missing or wrong, so
   several signals are weighed against each other, and what was skipped is reported rather than
   silently dropped.
@@ -86,7 +87,12 @@ Useful flags: `-d/--dir`, `-y/--yes`, `-n/--dry-run`, `--eula`, `--mc`, `--loade
 agreeing to a licence on your behalf because you skipped a prompt is not defensible.
 
 `--dry-run` exits `10` when changes are pending and `0` when current, so it works as a cron
-check. Security refusals exit `5`, transient network failures `4`.
+check. It downloads no JVM and runs no loader installer; a loader that still needs installing
+counts as a pending change.
+
+`--force-include`, `--force-exclude`, `--no-optional` and `--skip-blocked` are remembered, so a
+bare `hopper` keeps applying them. Passing `--force-include` or `--force-exclude` again replaces
+that list. Security refusals exit `5`, transient network failures `4`.
 
 ## Safety
 
@@ -95,14 +101,22 @@ check. Security refusals exit `5`, transient network failures `4`.
   genuinely unchanged.
 - Pack download hosts are restricted to Modrinth's allowlist, enforced on **every redirect hop**
   — checking only the declared URL would let an allowed host redirect anywhere.
-- Pack entry paths cannot escape the install directory; archive symlinks are resolved and
-  checked rather than trusted or blanket-banned.
+  GitHub's asset host is accepted only as a redirect from `github.com`, never as a URL a pack
+  names itself.
+- Pack entry paths cannot escape the install directory. Symlinks inside pack archives are
+  refused; inside JDK archives, where they are legitimate, each is checked to stay inside.
 - `world/`, `logs/`, ban lists and `server.properties` are never written or deleted.
+- `ops.json`, `whitelist.json`, the ban lists and `usercache.json` are never installed from a
+  pack, even into an empty directory: an author's `ops.json` would make them an operator on
+  your server.
+- A symlinked file or directory in the server (say `mods -> /srv/shared`) is never written
+  through or replaced; hopper reports it and leaves it alone.
 - **Forge and NeoForge installers are code hopper runs.** The installer jar is verified
   against the SHA-1 its Maven repository publishes, and runs in a cache directory, never in
   your server directory. The installer then downloads the vanilla jar and libraries itself,
   from Mojang and the loader's Maven, and those downloads are outside hopper's allowlist.
-  Only what it produced under `libraries/` is kept, as ordinary managed files.
+  Only what it produced under `libraries/` is kept, as ordinary managed files. It runs without
+  your CurseForge API key in its environment.
 - An interrupted run leaves a journal, and the next run reconciles rather than replaying, so the
   lockfile cannot durably disagree with the disk.
 
@@ -110,7 +124,7 @@ check. Security refusals exit `5`, transient network failures `4`.
 
 ```sh
 cargo build --release          # target/release/hopper, ~4MB
-cargo test                     # 503 tests, no network needed
+cargo test                     # 513 tests, no network needed
 ```
 
 ### A static binary for servers

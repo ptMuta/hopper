@@ -91,6 +91,10 @@ pub enum EnvSupport {
     Required,
     Optional,
     Unsupported,
+    /// Anything else, including the `unknown` that current Modrinth packs write. Says nothing
+    /// either way. One value hopper does not recognise must not make a whole pack unreadable.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -147,7 +151,10 @@ impl IndexFile {
     /// `None` when the pack said nothing — genuinely unknown, not a yes. Callers must route
     /// that through environment classification rather than defaulting either way here.
     pub fn wanted_on_server(&self) -> Option<bool> {
-        self.env.map(|e| e.server != EnvSupport::Unsupported)
+        match self.env?.server {
+            EnvSupport::Unknown => None,
+            server => Some(server != EnvSupport::Unsupported),
+        }
     }
 
     pub fn is_optional_on_server(&self) -> bool {
@@ -382,25 +389,22 @@ pub fn stage_overrides<R: Read + Seek>(
             .by_name(&entry.zip_name)
             .map_err(|e| MrpackError::Archive(e.to_string()))?;
 
-        let mut buf = Vec::new();
-        file.by_ref()
-            .take(MAX_ENTRY_BYTES + 1)
-            .read_to_end(&mut buf)
+        // Streamed into the store rather than buffered: an entry may be hundreds of megabytes,
+        // and holding it in memory is what gets hopper killed on a small VPS. A blob that turns
+        // out to exceed the limit is harmless in the store and is never referenced.
+        let blob = store
+            .insert_reader(&mut file.by_ref().take(MAX_ENTRY_BYTES + 1), None, None)
             .map_err(|e| MrpackError::Io(e.to_string()))?;
-        if buf.len() as u64 > MAX_ENTRY_BYTES {
+        if blob.size > MAX_ENTRY_BYTES {
             return Err(MrpackError::EntryTooLarge {
                 path: entry.zip_name.clone(),
                 limit: MAX_ENTRY_BYTES,
             });
         }
-        total = total.saturating_add(buf.len() as u64);
+        total = total.saturating_add(blob.size);
         if total > MAX_TOTAL_BYTES {
             return Err(MrpackError::TotalTooLarge(MAX_TOTAL_BYTES));
         }
-
-        let blob = store
-            .insert_bytes(&buf, None)
-            .map_err(|e| MrpackError::Io(e.to_string()))?;
         out.insert(entry.path.clone(), (blob.digest, blob.size));
     }
     Ok(out)

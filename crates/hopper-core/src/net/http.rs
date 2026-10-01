@@ -22,7 +22,7 @@ use crate::net::{HostAllowlist, HostError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum HttpError {
-    #[error("refused to fetch {url}: {source}")]
+    #[error("refused to fetch {url}")]
     Host {
         url: String,
         #[source]
@@ -122,7 +122,12 @@ impl HttpClient {
                 if attempt.previous().len() >= 5 {
                     return attempt.error("too many redirects");
                 }
-                match allow.check(attempt.url()) {
+                let from = attempt
+                    .previous()
+                    .last()
+                    .expect("a redirect always has a previous URL")
+                    .clone();
+                match allow.check_redirect(&from, attempt.url()) {
                     Ok(()) => attempt.follow(),
                     Err(e) => attempt.error(e),
                 }
@@ -195,6 +200,24 @@ impl HttpClient {
         }
     }
 
+    /// A send failure that is really an allowlist refusal on a redirect hop.
+    ///
+    /// reqwest reports it as a generic error, which would otherwise be retried and then
+    /// reported as a network problem. It is a security refusal, and retrying cannot help.
+    fn refused_redirect(url: &str, e: &reqwest::Error) -> Option<HttpError> {
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(e);
+        while let Some(c) = cause {
+            if let Some(host) = c.downcast_ref::<HostError>() {
+                return Some(HttpError::Host {
+                    url: url.to_owned(),
+                    source: host.clone(),
+                });
+            }
+            cause = c.source();
+        }
+        None
+    }
+
     /// GET, with retries, rate limiting and allowlist enforcement.
     pub async fn get_bytes(&self, url: &str) -> Result<Vec<u8>, HttpError> {
         let parsed = url::Url::parse(url).map_err(|_| HttpError::BadUrl {
@@ -225,7 +248,12 @@ impl HttpClient {
                         (Some(status), false, format!("HTTP {status}"))
                     }
                 }
-                Err(e) => (None, true, e.to_string()),
+                Err(e) => {
+                    if let Some(refused) = Self::refused_redirect(url, &e) {
+                        return Err(refused);
+                    }
+                    (None, true, e.to_string())
+                }
             };
             last = body;
 
@@ -303,6 +331,9 @@ impl HttpClient {
                     last = format!("HTTP {status}");
                 }
                 Err(e) => {
+                    if let Some(refused) = Self::refused_redirect(url, &e) {
+                        return Err(refused);
+                    }
                     last = e.to_string();
                     if !self.retry.should_retry(attempt, None) {
                         return Err(HttpError::Exhausted {
@@ -348,15 +379,12 @@ impl HttpClient {
             })?;
 
         self.await_budget().await;
-        let resp = self
-            .inner
-            .get(parsed)
-            .send()
-            .await
-            .map_err(|e| HttpError::Transport {
+        let resp = self.inner.get(parsed).send().await.map_err(|e| {
+            Self::refused_redirect(url, &e).unwrap_or_else(|| HttpError::Transport {
                 url: url.to_owned(),
                 message: e.to_string(),
-            })?;
+            })
+        })?;
 
         let status = resp.status().as_u16();
         self.observe(resp.headers(), status);

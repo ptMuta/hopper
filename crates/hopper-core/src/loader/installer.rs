@@ -26,10 +26,35 @@ pub enum InstallerError {
     NoLaunchTarget { loader: LoaderKind },
     #[error("the installer produced an unusable path {0:?}")]
     BadPath(String),
+    #[error("refusing {what} {value:?}: only letters, digits and . _ + - are allowed")]
+    UnsafeVersion { what: &'static str, value: String },
     #[error("malformed checksum sidecar: {0:?}")]
     BadSidecar(String),
     #[error("reading installer output: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Check a version string before it reaches a path or a URL.
+///
+/// Both the Minecraft version and the loader build come from the pack, and both are formatted
+/// into the installer URL and into a cache directory name that is later deleted and renamed.
+/// A version is a short token; anything else is refused rather than escaped.
+pub fn check_version(what: &'static str, value: &str) -> Result<(), InstallerError> {
+    let ok = !value.is_empty()
+        && value.len() <= 64
+        && !value.starts_with('.')
+        && !value.contains("..")
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(InstallerError::UnsafeVersion {
+            what,
+            value: value.to_owned(),
+        })
+    }
 }
 
 /// Maven coordinates of the installer for a resolved loader build.
@@ -38,6 +63,8 @@ pub fn installer_url(
     mc: &MinecraftVersion,
     version: &str,
 ) -> Result<String, InstallerError> {
+    check_version("Minecraft version", mc.as_str())?;
+    check_version("loader version", version)?;
     match loader {
         LoaderKind::Forge => Ok(super::ForgePromotions::installer_url(mc, version)),
         // NeoForge's first release, for 1.20.1, still used Forge's artifact layout under the
@@ -86,13 +113,15 @@ pub fn staging_dir(
     loader: LoaderKind,
     mc: &MinecraftVersion,
     version: &str,
-) -> PathBuf {
-    cache_root.join("installers").join(format!(
+) -> Result<PathBuf, InstallerError> {
+    check_version("Minecraft version", mc.as_str())?;
+    check_version("loader version", version)?;
+    Ok(cache_root.join("installers").join(format!(
         "{}-{}-{}",
         loader.mrpack_key().unwrap_or("vanilla"),
         mc.as_str(),
         version
-    ))
+    )))
 }
 
 /// Recorded once an installer run has been collected, so later runs skip both the installer and
@@ -392,13 +421,14 @@ mod tests {
 
     #[test]
     fn staging_is_keyed_by_loader_minecraft_and_build() {
-        let a = staging_dir(Path::new("/c"), LoaderKind::Forge, &mc("1.20.1"), "47.2.0");
+        let a = staging_dir(Path::new("/c"), LoaderKind::Forge, &mc("1.20.1"), "47.2.0").unwrap();
         let b = staging_dir(
             Path::new("/c"),
             LoaderKind::NeoForge,
             &mc("1.20.1"),
             "47.2.0",
-        );
+        )
+        .unwrap();
         assert_ne!(a, b);
         assert!(a.starts_with("/c/installers"));
     }

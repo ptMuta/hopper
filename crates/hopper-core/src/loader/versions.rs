@@ -9,6 +9,9 @@ use crate::model::MinecraftVersion;
 
 pub const NEOFORGE_MAVEN_METADATA: &str =
     "https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml";
+/// NeoForge's 1.20.1 builds, published under Forge's artifact name before the rename.
+pub const NEOFORGE_LEGACY_MAVEN_METADATA: &str =
+    "https://maven.neoforged.net/releases/net/neoforged/forge/maven-metadata.xml";
 pub const FORGE_PROMOTIONS: &str =
     "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json";
 
@@ -71,6 +74,19 @@ pub fn neoforge_versions_for(all: &[String], mc: &MinecraftVersion) -> Vec<Strin
     // Maven metadata is oldest-first.
     matching.reverse();
     matching
+}
+
+/// NeoForge builds for 1.20.1, newest first, from [`NEOFORGE_LEGACY_MAVEN_METADATA`].
+///
+/// They are versioned `1.20.1-47.1.x`; the part after the Minecraft version is the build.
+pub fn neoforge_legacy_versions(all: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = all
+        .iter()
+        .filter_map(|v| v.strip_prefix("1.20.1-"))
+        .map(str::to_owned)
+        .collect();
+    out.reverse();
+    out
 }
 
 /// `1.21.1` -> `21.1.`, `1.21` -> `21.0.`
@@ -181,6 +197,12 @@ mod tests {
         assert_eq!(neoforge_prefix(&MinecraftVersion::new("26.3")), None);
         let all = parse_maven_metadata(MAVEN_XML).unwrap();
         assert!(neoforge_versions_for(&all, &MinecraftVersion::new("26.3")).is_empty());
+    }
+
+    #[test]
+    fn neoforge_1_20_1_builds_come_from_the_legacy_artifact() {
+        let all = vec!["1.20.1-47.1.3".to_owned(), "1.20.1-47.1.106".to_owned()];
+        assert_eq!(neoforge_legacy_versions(&all), ["47.1.106", "47.1.3"]);
     }
 
     #[test]

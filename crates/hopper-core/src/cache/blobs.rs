@@ -266,8 +266,8 @@ impl BlobStore {
         executable: bool,
     ) -> Result<(), BlobError> {
         let src = self.path_for(digest)?;
-        let bytes = hfs::read(&src)?;
-        hfs::write_atomic(dest, &bytes, executable)?;
+        let mut file = std::fs::File::open(&src).map_err(|e| IoPath::new("open", &src, e))?;
+        hfs::write_atomic_from(dest, &mut file, executable)?;
         Ok(())
     }
 

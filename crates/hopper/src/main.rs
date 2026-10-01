@@ -270,6 +270,62 @@ async fn install(cli: &Cli) -> Result<i32> {
         Err(e) => bail!(e),
     };
 
+    // A positional VERSION means the same as `pack@version`. Folded in here, once, so every
+    // source honours it and a bare `hopper` later replays the same pin.
+    let (spec, source_arg) = match (&cli.install.version, spec) {
+        (
+            Some(v),
+            SourceSpec::Ambiguous {
+                token,
+                version: None,
+            },
+        ) => (
+            SourceSpec::Ambiguous {
+                token: token.clone(),
+                version: Some(v.clone()),
+            },
+            format!("{token}@{v}"),
+        ),
+        (
+            Some(v),
+            SourceSpec::Pack {
+                slug,
+                version: None,
+            },
+        ) => (
+            SourceSpec::Pack {
+                slug: slug.clone(),
+                version: Some(v.clone()),
+            },
+            format!("{slug}@{v}"),
+        ),
+        (
+            Some(v),
+            SourceSpec::CurseForge {
+                slug,
+                version: None,
+            },
+        ) => (
+            SourceSpec::CurseForge {
+                slug: slug.clone(),
+                version: Some(v.clone()),
+            },
+            format!("cf:{slug}@{v}"),
+        ),
+        (
+            Some(_),
+            SourceSpec::Ambiguous { .. } | SourceSpec::Pack { .. } | SourceSpec::CurseForge { .. },
+        ) => {
+            eprintln!("error: the version is given twice, as pack@version and as an argument");
+            return Ok(exit::GENERIC);
+        }
+        (Some(_), _) => {
+            eprintln!("error: a version can only be given for a pack named by its slug");
+            return Ok(exit::GENERIC);
+        }
+        (None, spec) => (spec, source_arg),
+    };
+
     let cache = cache_dir()?;
     let store = BlobStore::new(&cache);
     // One client for both the API and the CDN it hands out URLs for; pack downloads are
@@ -289,11 +345,16 @@ async fn install(cli: &Cli) -> Result<i32> {
         api_key: cf_key.as_deref(),
         user_agent: &user_agent(),
         mc: wanted_mc.as_ref(),
+        installed_project: existing
+            .as_ref()
+            .filter(|l| l.pack.registry == Some(hopper_core::model::RegistryId::CurseForge))
+            .and_then(|l| l.pack.project_id.as_deref()),
         fallback_accepted: existing
             .as_ref()
             .is_some_and(|l| l.policy.client_pack_fallback),
         allow_client_pack: cli.install.allow_client_pack,
         skip_blocked: cli.install.skip_blocked,
+        skip_blocked_remembered: existing.as_ref().is_some_and(|l| l.policy.skip_blocked),
         yes: cli.global.yes,
         dry_run: cli.global.dry_run,
         quiet: cli.global.quiet,
@@ -320,7 +381,7 @@ async fn install(cli: &Cli) -> Result<i32> {
             (pack, Default::default())
         }
         SourceSpec::CurseForge { slug, version } => {
-            let version = version.as_deref().or(cli.install.version.as_deref());
+            let version = version.as_deref();
             match curseforge::resolve(slug, version, &store, &cf_opts, confirm).await? {
                 curseforge::Outcome::Declined => {
                     println!("Aborted. Nothing changed.");
@@ -354,7 +415,7 @@ async fn install(cli: &Cli) -> Result<i32> {
                     if !cli.global.quiet {
                         println!("note: {token:?} is not on Modrinth; looking on CurseForge");
                     }
-                    let version = version.as_deref().or(cli.install.version.as_deref());
+                    let version = version.as_deref();
                     match curseforge::resolve(token, version, &store, &cf_opts, confirm).await? {
                         curseforge::Outcome::Declined => {
                             println!("Aborted. Nothing changed.");
@@ -363,8 +424,8 @@ async fn install(cli: &Cli) -> Result<i32> {
                         curseforge::Outcome::Resolved(r) => {
                             let r = *r;
                             source_arg = match version {
-                                Some(v) if source_arg.contains('@') => format!("cf:{token}@{v}"),
-                                _ => format!("cf:{token}"),
+                                Some(v) => format!("cf:{token}@{v}"),
+                                None => format!("cf:{token}"),
                             };
                             let out = (r.pack.clone(), r.overrides.clone());
                             cf_source = Some(r);
@@ -439,24 +500,53 @@ async fn finish_install(
     }
 
     // 2. Classify for a server.
-    let includes = cli.install.force_include.clone();
-    let excludes = cli.install.force_exclude.clone();
+    //
+    // The operator's rules are remembered, or a bare `hopper` from cron would reinstall the
+    // client-only mod they excluded to make the server start. Passing a flag again replaces
+    // the remembered list for that flag.
+    let stored = existing.as_ref().map(|l| &l.policy);
+    let pick = |given: &Vec<String>, kept: Option<&Vec<String>>| -> Vec<String> {
+        if given.is_empty() {
+            kept.cloned().unwrap_or_default()
+        } else {
+            given.clone()
+        }
+    };
+    let includes = pick(&cli.install.force_include, stored.map(|p| &p.force_include));
+    let excludes = pick(&cli.install.force_exclude, stored.map(|p| &p.force_exclude));
+    let include_optional = !cli.install.no_optional && stored.is_none_or(|p| p.include_optional);
+    if !cli.global.quiet {
+        let remembered = |flag: &str, given: &Vec<String>, used: &Vec<String>| {
+            if given.is_empty() && !used.is_empty() {
+                println!("Remembered: {flag} {}", used.join(", "));
+            }
+        };
+        remembered("--force-include", &cli.install.force_include, &includes);
+        remembered("--force-exclude", &cli.install.force_exclude, &excludes);
+        if !cli.install.no_optional && !include_optional {
+            println!("Remembered: --no-optional");
+        }
+    }
+    let (rule_includes, rule_excludes) = (includes.clone(), excludes.clone());
     let overrides = move |path: &RelPath| -> Option<Override> {
         let name = path.as_str();
-        if excludes.iter().any(|e| name.contains(e.as_str())) {
+        if rule_excludes.iter().any(|e| name.contains(e.as_str())) {
             Some(Override::Exclude)
-        } else if includes.iter().any(|i| name.contains(i.as_str())) {
+        } else if rule_includes.iter().any(|i| name.contains(i.as_str())) {
             Some(Override::Include)
         } else {
             None
         }
     };
-    let resolved = resolve_for_server(
-        &pack,
-        !cli.install.no_optional,
-        &overrides,
-        &override_content,
-    );
+    let resolved = resolve_for_server(&pack, include_optional, &overrides, &override_content);
+
+    if !cli.global.quiet && !resolved.access_lists.is_empty() {
+        let names: Vec<&str> = resolved.access_lists.iter().map(RelPath::as_str).collect();
+        println!(
+            "note: the pack ships {}; access lists are yours alone and were not installed\n",
+            names.join(", ")
+        );
+    }
 
     if !cli.global.quiet && resolved.skipped_count() > 0 {
         println!(
@@ -500,9 +590,27 @@ async fn finish_install(
     };
 
     let mut desired = resolved.desired.clone();
+    let mut installer_pending = false;
     if let Some((rt, _)) = &runtime {
         for f in &rt.files {
             desired.insert(f.clone());
+        }
+        // A dry run does not run the installer. Hold the installed loader files where they
+        // are, so the plan does not show them as removed.
+        if rt.installer_pending {
+            installer_pending = true;
+            for f in existing.iter().flat_map(|l| &l.files) {
+                if matches!(f.provenance, hopper_core::model::Provenance::Loader { .. }) {
+                    desired.insert(hopper_core::plan::DesiredFile {
+                        path: f.path.clone(),
+                        content: f.digest.clone(),
+                        size: Some(f.size),
+                        executable: f.executable,
+                        provenance: f.provenance.clone(),
+                        managed: f.managed,
+                    });
+                }
+            }
         }
     }
 
@@ -538,6 +646,18 @@ async fn finish_install(
         }
     }
 
+    if installer_pending {
+        if !cli.global.quiet {
+            println!(
+                "\n  {} {} is not installed yet; a real run will run its installer",
+                pack.index.loader,
+                runtime
+                    .as_ref()
+                    .map_or("", |(rt, _)| rt.loader_version.as_str())
+            );
+        }
+        return Ok(exit::CHANGES_PENDING);
+    }
     if !summary.changes_anything() {
         return Ok(exit::OK);
     }
@@ -559,7 +679,12 @@ async fn finish_install(
     //    installed file that is not recorded can never be updated or cleaned up afterwards.
     let mut entries: BTreeMap<RelPath, LockedFile> = BTreeMap::new();
     for (path, file) in desired.iter() {
-        let (digest, size) = match pack.index.files.iter().find(|f| f.path == *path) {
+        // Matched on content as well as path: an override can replace an index file at the same
+        // path, and must not send us downloading the index file's URL for the override's bytes.
+        let index_entry = pack.index.files.iter().find(|f| {
+            f.path == *path && f.hashes.get(hopper_core::HashAlgo::Sha512) == Some(&file.content)
+        });
+        let (digest, size) = match index_entry {
             Some(index_file) => {
                 let urls: Vec<String> = index_file
                     .downloads
@@ -601,12 +726,25 @@ async fn finish_install(
         template.pack.project_id = Some(r.project_id.clone());
         template.pack.file_id = Some(r.file_id.clone());
         template.policy.client_pack_fallback = r.client_pack_fallback;
+        template.policy.skip_blocked = r.skipped_blocked;
     }
-    template.policy.include_optional = !cli.install.no_optional;
+    template.policy.include_optional = include_optional;
+    template.policy.force_include = includes;
+    template.policy.force_exclude = excludes;
     if let Some((rt, _)) = &runtime {
         template.server.loader_version = rt.loader_version.clone();
         template.server.java_major = rt.java_major;
     }
+    let start = match &runtime {
+        Some((rt, java)) => Some(plan_start_script(root, rt, java, existing.as_ref())?),
+        None => None,
+    };
+    template.server.start_script = match &start {
+        Some(StartScript::Write { digest, .. }) => Some(digest.clone()),
+        Some(StartScript::KeepEdited { .. }) | None => existing
+            .as_ref()
+            .and_then(|l| l.server.start_script.clone()),
+    };
     let next = next_lockfile(existing.as_ref(), &decisions, &entries, template);
     let txn = format!("{}", std::process::id());
     let applied = apply(
@@ -621,8 +759,8 @@ async fn finish_install(
     .context("applying the plan")?;
 
     // 7. Bootstrap: one start command regardless of loader.
-    if let Some((rt, java)) = &runtime {
-        write_start_script(root, rt, java)?;
+    if let Some(start) = &start {
+        write_start_script(root, start, cli.global.quiet)?;
     }
 
     let props = root.join("server.properties");
@@ -734,13 +872,51 @@ async fn fetch_from_registry(
         );
     }
 
-    client
+    let bytes = client
         .get_bytes(&pack.file_url)
         .await
-        .with_context(|| format!("downloading {}", pack.file_name))
+        .with_context(|| format!("downloading {}", pack.file_name))?;
+    verify_pack(&bytes, &pack).with_context(|| format!("verifying {}", pack.file_name))?;
+    Ok(bytes)
+}
+
+/// Check a downloaded `.mrpack` against the hashes Modrinth published for it.
+///
+/// Every file the pack lists is verified, so the pack itself must be too: it decides which
+/// files and hashes those are.
+fn verify_pack(
+    bytes: &[u8],
+    pack: &hopper_core::api::client::PackVersion,
+) -> Result<(), hopper_core::cache::BlobError> {
+    use hopper_core::cache::BlobError;
+
+    let mut hasher = hopper_core::MultiHasher::new();
+    hasher.update(bytes);
+    let (observed, _) = hasher.finish();
+    if let Some(expected) = pack.hashes.strongest()
+        && pack.hashes.verify(&observed) == Some(false)
+    {
+        return Err(BlobError::HashMismatch {
+            expected: expected.clone(),
+            actual: observed
+                .get(expected.algo())
+                .cloned()
+                .unwrap_or_else(|| expected.clone()),
+        });
+    }
+    if pack.size != 0 && pack.size != bytes.len() as u64 {
+        return Err(BlobError::SizeMismatch {
+            expected: pack.size,
+            actual: bytes.len() as u64,
+        });
+    }
+    Ok(())
 }
 
 fn scan(root: &Path, interesting: &[RelPath]) -> DiskState {
+    use hopper_core::fs::FileKind;
+    use hopper_core::plan::EntryKind;
+
     let mut disk = DiskState::new();
 
     // `<path>.disabled` has to be in the scan or reconcile cannot see the marker, and an
@@ -752,13 +928,53 @@ fn scan(root: &Path, interesting: &[RelPath]) -> DiskState {
             .filter_map(|p| p.with_suffix(".disabled").ok()),
     );
 
+    // Whatever is not a plain file is reported as what it is, so reconcile refuses it rather
+    // than writing over or through it. A symlinked ancestor counts as a symlink: writing
+    // `mods/x.jar` through `mods -> /srv/shared` would escape the directory being managed.
+    let mut ancestor_links: std::collections::HashMap<String, bool> = Default::default();
+    let mut through_link = |path: &RelPath| -> bool {
+        let segments: Vec<&str> = path.as_str().split('/').collect();
+        let mut prefix = String::new();
+        for segment in &segments[..segments.len() - 1] {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(segment);
+            let linked = *ancestor_links.entry(prefix.clone()).or_insert_with(|| {
+                matches!(hfs::kind_of(&root.join(&prefix)), Ok(FileKind::Symlink))
+            });
+            if linked {
+                return true;
+            }
+        }
+        false
+    };
+
+    let other = |kind| DiskEntry {
+        kind,
+        digest: None,
+        size: 0,
+        executable: false,
+        mtime_ns: None,
+    };
     for path in &paths {
         let full = path.resolve_under(root);
-        if let Ok(hopper_core::fs::FileKind::File) = hfs::kind_of(&full)
-            && let Ok((_, digest)) = hfs::hash_file(&full)
-        {
-            let size = std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
-            disk.insert(path.clone(), DiskEntry::file(digest, size));
+        let kind = if through_link(path) {
+            Ok(FileKind::Symlink)
+        } else {
+            hfs::kind_of(&full)
+        };
+        match kind {
+            Ok(FileKind::File) => {
+                if let Ok((_, digest)) = hfs::hash_file(&full) {
+                    let size = std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
+                    disk.insert(path.clone(), DiskEntry::file(digest, size));
+                }
+            }
+            Ok(FileKind::Symlink) => disk.insert(path.clone(), other(EntryKind::Symlink)),
+            Ok(FileKind::Dir) => disk.insert(path.clone(), other(EntryKind::Dir)),
+            Ok(FileKind::Other) => disk.insert(path.clone(), other(EntryKind::Other)),
+            Ok(FileKind::Missing) | Err(_) => {}
         }
     }
     disk
@@ -919,6 +1135,8 @@ async fn resolve_runtime(
     // Provision before anything is written to the server directory, so a failure here leaves
     // it untouched.
     let java = match java {
+        // A dry run downloads no JVM; the plan above already said which one would be.
+        plan @ hopper_core::java::JavaPlan::Provision { .. } if cli.global.dry_run => plan,
         hopper_core::java::JavaPlan::Provision { candidate } => {
             let data = runtime::data_dir()?;
             let installed = runtime::provision_java(&client, store, &candidate, &data).await?;
@@ -946,6 +1164,7 @@ async fn resolve_runtime(
             java: java_path.as_deref(),
             cache_root: &cache_root,
             quiet: cli.global.quiet,
+            run_installer: !cli.global.dry_run,
         },
     )
     .await?;
@@ -986,13 +1205,28 @@ fn describe_java(plan: &hopper_core::java::JavaPlan, major: u32, quiet: bool) {
 }
 
 /// Emit `start.sh` and, on first install, `jvm.args`.
-fn write_start_script(
+/// What to do about `start.sh`, decided before apply so the lockfile can record it.
+enum StartScript {
+    Write {
+        content: String,
+        digest: hopper_core::model::Digest,
+    },
+    /// The operator edited the script. Theirs stays; ours goes beside it.
+    KeepEdited { content: String },
+}
+
+/// Regenerate `start.sh` unless the operator has edited it since hopper last wrote it.
+///
+/// Its header promises exactly this, so an edit is detected by comparing the file with what
+/// the lockfile says hopper wrote.
+fn plan_start_script(
     root: &Path,
     runtime: &runtime::Runtime,
     java: &hopper_core::java::JavaPlan,
-) -> Result<()> {
+    previous: Option<&Lockfile>,
+) -> Result<StartScript> {
     use hopper_core::java::JavaPlan;
-    use hopper_core::server::{JavaLocation, jvm_args_file, start_script, suggested_heap_gb};
+    use hopper_core::server::{JavaLocation, start_script};
 
     let location = match java {
         JavaPlan::UseExisting { java } => JavaLocation::System {
@@ -1004,8 +1238,38 @@ fn write_start_script(
             path: "java".into(),
         },
     };
-
     let args_path = RelPath::parse("jvm.args").expect("a constant path");
+    let content = start_script(
+        &runtime.launch,
+        &location,
+        Some(&args_path),
+        env!("CARGO_PKG_VERSION"),
+    );
+    let mut hasher = hopper_core::MultiHasher::new();
+    hasher.update(content.as_bytes());
+    let (_, digest) = hasher.finish();
+
+    let path = root.join("start.sh");
+    let on_disk = match hfs::kind_of(&path)? {
+        hopper_core::fs::FileKind::Missing => None,
+        hopper_core::fs::FileKind::File => Some(hfs::hash_file(&path)?.1),
+        // A link or a directory is the operator's arrangement, never written through.
+        _ => return Ok(StartScript::KeepEdited { content }),
+    };
+    let last_written = previous.and_then(|l| l.server.start_script.as_ref());
+    Ok(match on_disk {
+        None => StartScript::Write { content, digest },
+        Some(d) if d == digest || Some(&d) == last_written => {
+            StartScript::Write { content, digest }
+        }
+        // Either edited since we wrote it, or not ours at all (no record, different content).
+        Some(_) => StartScript::KeepEdited { content },
+    })
+}
+
+fn write_start_script(root: &Path, plan: &StartScript, quiet: bool) -> Result<()> {
+    use hopper_core::server::{jvm_args_file, suggested_heap_gb};
+
     let jvm_args = root.join("jvm.args");
     if !jvm_args.exists() {
         // Seeded once, then the operator's file.
@@ -1018,18 +1282,25 @@ fn write_start_script(
         .context("writing jvm.args")?;
     }
 
-    hfs::write_atomic(
-        &root.join("start.sh"),
-        start_script(
-            &runtime.launch,
-            &location,
-            Some(&args_path),
-            env!("CARGO_PKG_VERSION"),
-        )
-        .as_bytes(),
-        true,
-    )
-    .context("writing start.sh")?;
+    match plan {
+        StartScript::Write { content, .. } => {
+            hfs::write_atomic(&root.join("start.sh"), content.as_bytes(), true)
+                .context("writing start.sh")?;
+        }
+        StartScript::KeepEdited { content } => {
+            let beside = root.join("start.sh.new");
+            if hfs::kind_of(&beside)? == hopper_core::fs::FileKind::Missing
+                || hfs::kind_of(&beside)? == hopper_core::fs::FileKind::File
+            {
+                hfs::write_atomic(&beside, content.as_bytes(), true)
+                    .context("writing start.sh.new")?;
+            }
+            if !quiet {
+                println!("\n  start.sh was edited, so it was left alone; the regenerated one");
+                println!("  is in start.sh.new to compare against.");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1076,6 +1347,7 @@ fn lockfile_template(pack: &Mrpack, source_arg: &str, previous: Option<&Lockfile
             loader: pack.index.loader,
             loader_version: pack.index.loader_version.clone().unwrap_or_default(),
             java_major: previous.map(|p| p.server.java_major).unwrap_or(21),
+            start_script: None,
         },
         pack: PackRecord {
             name: pack.index.name.clone(),
@@ -1158,6 +1430,45 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    fn runtime() -> super::runtime::Runtime {
+        super::runtime::Runtime {
+            files: vec![],
+            launch: hopper_core::loader::LaunchProfile::ExecutableJar {
+                jar: hopper_core::RelPath::parse("server.jar").unwrap(),
+                jvm_args: vec![],
+                program_args: vec!["nogui".into()],
+            },
+            java_major: 21,
+            loader_version: String::new(),
+            installer_pending: false,
+        }
+    }
+
+    #[test]
+    fn an_edited_start_script_is_left_alone() {
+        use super::StartScript;
+        let dir = tempfile::tempdir().unwrap();
+        let java = hopper_core::java::JavaPlan::Unavailable {
+            major: 21,
+            platform: hopper_core::java::Platform {
+                os: hopper_core::java::Os::Linux,
+                arch: hopper_core::java::Arch::X64,
+            },
+        };
+        let plan = || super::plan_start_script(dir.path(), &runtime(), &java, None).unwrap();
+
+        // Absent: written.
+        let StartScript::Write { content, .. } = plan() else {
+            panic!("a missing start.sh is written");
+        };
+        // Unchanged since written: rewritten freely.
+        std::fs::write(dir.path().join("start.sh"), &content).unwrap();
+        assert!(matches!(plan(), StartScript::Write { .. }));
+        // Edited, and no record says hopper wrote that: kept.
+        std::fs::write(dir.path().join("start.sh"), format!("{content}\n# mine\n")).unwrap();
+        assert!(matches!(plan(), StartScript::KeepEdited { .. }));
+    }
+
     #[test]
     fn wrapped_failures_keep_their_exit_codes() {
         use hopper_core::api::curseforge::CurseForgeError;

@@ -100,6 +100,23 @@ pub enum Command {
         command: Vec<String>,
     },
 
+    /// Show the server at a glance: status, MOTD, players, version and the address to share
+    Show {
+        /// Plain `key: value` lines, no art or colour (the default when piped)
+        #[arg(long)]
+        plain: bool,
+    },
+
+    /// Show the server's log (journalctl for its systemd unit)
+    ///
+    /// Everything after `logs` goes to journalctl unchanged: `hopper logs -f`,
+    /// `hopper logs -n 50 --since today`. Put --dir before `logs`.
+    Logs {
+        /// Flags for journalctl [default: open at the end]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Print a shell completion script
     ///
     /// For example: hopper completions bash > ~/.local/share/bash-completion/completions/hopper

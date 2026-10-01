@@ -549,3 +549,29 @@ fn dot_folders_in_a_pack_are_never_installed() {
     assert!(!s.exists(".mixin.out"), "{out}");
     assert!(!s.exists("mods/.connector"), "{out}");
 }
+
+#[test]
+fn a_packs_default_server_properties_seeds_the_real_file_instead_of_being_installed() {
+    // Installed, it would let a mod replace server.properties with it on first start, wiping
+    // RCON and the chosen port. Seeding from it keeps the pack's intent without that.
+    let s = Server::new();
+    let pack = s.dir.path().join("p.mrpack");
+    build_pack(
+        &pack,
+        "1.0.0",
+        &[
+            (
+                "overrides/default-server.properties",
+                "allow-nether=false\nmax-tick-time=-1\n",
+            ),
+            ("overrides/config/a.toml", "a = 1\n"),
+        ],
+    );
+    let (out, err, code) = s.install(&pack, &["--yes"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(!s.exists("default-server.properties"), "{out}");
+    let props = s.read("server.properties").unwrap();
+    assert!(props.contains("allow-nether=false\n"), "{props}");
+    assert!(props.contains("max-tick-time=-1\n"), "{props}");
+    assert!(props.contains("server-port="), "{props}");
+}

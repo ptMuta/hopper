@@ -5,6 +5,7 @@
 //! loader — which is the only way to hide the Fabric-launch-jar versus NeoForge-argfile split
 //! from the operator.
 
+pub mod ping;
 pub mod ports;
 pub mod properties;
 pub mod rcon;
@@ -49,6 +50,33 @@ pub fn eula_accepted(contents: &str) -> bool {
 ///
 /// Seeded once and then never touched again: the operator's port, MOTD and difficulty are
 /// theirs, and a pack update has no business rewriting them.
+/// Where packs put the settings a fresh server should start with.
+///
+/// A convention, not a Minecraft feature: a mod (Default Server Properties, used by FTB and
+/// others) copies it over `server.properties` on the first start, discarding whatever was
+/// there, including RCON and the port hopper chose. hopper honours the convention itself
+/// instead, seeding `server.properties` from it, and does not install the file, so nothing
+/// replaces the operator's settings behind their back.
+pub const PACK_DEFAULT_PROPERTIES: &str = "default-server.properties";
+
+/// `server.properties` for a new server: the pack's defaults when it ships them, with the
+/// game port hopper chose.
+pub fn seed_server_properties(pack_defaults: Option<&str>, server_port: u16) -> String {
+    match pack_defaults {
+        None => default_server_properties(server_port),
+        Some(defaults) => properties::set(
+            &format!(
+                "# Minecraft server properties\n\
+                 # Seeded by hopper from the pack's {PACK_DEFAULT_PROPERTIES}. hopper will not\n\
+                 # modify this file again, except `hopper service install`, which sets the\n\
+                 # rcon settings.\n\
+                 {defaults}"
+            ),
+            &[("server-port", &server_port.to_string())],
+        ),
+    }
+}
+
 pub fn default_server_properties(server_port: u16) -> String {
     format!(
         "# Minecraft server properties\n\
@@ -226,6 +254,11 @@ mod tests {
 
     #[test]
     fn server_properties_are_seeded_with_sane_defaults() {
+        let seeded = seed_server_properties(Some("allow-nether=false\nserver-port=25565\n"), 25570);
+        assert!(seeded.contains("allow-nether=false\n"));
+        assert!(seeded.contains("server-port=25570\n"));
+        assert!(!seeded.contains("server-port=25565"));
+
         let p = default_server_properties(25565);
         assert!(p.contains("server-port=25565"));
         // States plainly that it will not be touched again.

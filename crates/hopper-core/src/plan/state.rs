@@ -161,6 +161,10 @@ impl DesiredSet {
         self.files.get(path)
     }
 
+    pub fn remove(&mut self, path: &RelPath) -> Option<DesiredFile> {
+        self.files.remove(path)
+    }
+
     pub fn paths(&self) -> impl Iterator<Item = &RelPath> {
         self.files.keys()
     }

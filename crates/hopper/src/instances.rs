@@ -80,14 +80,9 @@ pub fn port_free(port: u16) -> bool {
     }
 }
 
-/// A free game port for a new server in `dir`.
-pub fn pick_server_port(dir: &Path) -> u16 {
-    ports::pick(
-        ports::DEFAULT_SERVER_PORT,
-        &claimed_by_others(dir),
-        port_free,
-    )
-    .unwrap_or(ports::DEFAULT_SERVER_PORT)
+/// A free game port for a new server in `dir`, searching up from `start`.
+pub fn pick_server_port_from(dir: &Path, start: u16) -> u16 {
+    ports::pick(start, &claimed_by_others(dir), port_free).unwrap_or(start)
 }
 
 /// A free RCON port for the server in `dir`, clear of its own ports too.

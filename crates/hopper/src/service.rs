@@ -14,7 +14,7 @@ use hopper_core::server::systemd::{Schedule, ServerUnits, unit_stem};
 use crate::cli::exit;
 
 /// Where systemd looks for the operator's own units.
-fn unit_dir() -> Result<PathBuf> {
+pub fn unit_dir() -> Result<PathBuf> {
     let base = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".config")))
@@ -108,6 +108,11 @@ pub fn install(opts: &InstallOptions<'_>) -> Result<i32> {
         if !ok {
             bail!("systemd does not accept {expr:?} as an OnCalendar schedule");
         }
+    }
+
+    // A service that cannot start is no use; ask now rather than letting it fail quietly.
+    if !crate::eula_accepted(&dir) && !opts.quiet {
+        crate::offer_eula(&dir, false)?;
     }
 
     // 1. RCON, so `hopper console` can reach a server that has no terminal.
@@ -214,8 +219,14 @@ pub fn remove(dir: &Path, name: Option<&str>, quiet: bool) -> Result<i32> {
     let units = units_for(&dir, &stem, "", &hopper);
     let unit_dir = unit_dir()?;
 
-    let _ = systemctl(&["disable", "--now", &units.timer_name()]);
-    let _ = systemctl(&["disable", "--now", &units.service_name()]);
+    // Only units that exist, or systemctl prints an alarming "does not exist" for an
+    // installation that simply never had a timer.
+    if unit_dir.join(units.timer_name()).exists() {
+        let _ = systemctl(&["disable", "--now", &units.timer_name()]);
+    }
+    if unit_dir.join(units.service_name()).exists() {
+        let _ = systemctl(&["disable", "--now", &units.service_name()]);
+    }
     let mut removed = 0;
     for name in [
         units.service_name(),
@@ -433,23 +444,158 @@ fn store_curseforge_key(quiet: bool) -> Result<()> {
     Ok(())
 }
 
-/// `hopper console`: one command from the arguments, or an interactive prompt.
-pub fn console(dir: &Path, command: &[String]) -> Result<i32> {
+/// `hopper logs`: the server's journal, with any journalctl flags passed through.
+///
+/// Replaces this process with journalctl, so its pager, colours and Ctrl-C behave exactly as
+/// they do when run by hand. With no flags, opens at the end of the log.
+pub fn logs(dir: &Path, args: &[String]) -> Result<i32> {
+    let unit = unit_for(dir).with_context(|| {
+        format!(
+            "no hopper service runs {}; `hopper service install` creates one",
+            dir.display()
+        )
+    })?;
+    let mut cmd = Command::new("journalctl");
+    cmd.args(["--user", "--unit", &unit]);
+    if args.is_empty() {
+        cmd.arg("--pager-end");
+    } else {
+        cmd.args(args);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = cmd.exec();
+        Err(err).context("running journalctl")
+    }
+    #[cfg(not(unix))]
+    {
+        let status = cmd.status().context("running journalctl")?;
+        Ok(status.code().unwrap_or(exit::GENERIC))
+    }
+}
+
+/// The hopper service unit that runs the server in `dir`, if one is installed.
+///
+/// Found by the `WorkingDirectory=` hopper wrote, so a custom `--name` is found too.
+pub fn unit_for(dir: &Path) -> Option<String> {
+    let dir = dir.canonicalize().ok()?;
+    let units = unit_dir().ok()?;
+    std::fs::read_dir(units)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| {
+            n.starts_with("hopper-") && n.ends_with(".service") && !n.ends_with("-update.service")
+        })
+        .find(|name| {
+            std::fs::read_to_string(unit_dir().unwrap_or_default().join(name))
+                .ok()
+                .and_then(|text| {
+                    text.lines()
+                        .find_map(|l| l.strip_prefix("WorkingDirectory="))
+                        .map(|d| PathBuf::from(d.replace("%%", "%")))
+                })
+                .is_some_and(|d| d == dir)
+        })
+}
+
+/// `systemctl --user show` of one property, trimmed.
+pub fn unit_property(unit: &str, property: &str) -> Option<String> {
+    let out = Command::new("systemctl")
+        .args(["--user", "show", unit, "--property", property, "--value"])
+        .output()
+        .ok()?;
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!v.is_empty()).then_some(v)
+}
+
+/// Connection details for the server's RCON, from its server.properties.
+struct RconTarget {
+    host: String,
+    port: u16,
+    password: String,
+}
+
+fn rcon_target(dir: &Path, unit: Option<&str>) -> Result<RconTarget> {
     let text = std::fs::read_to_string(dir.join("server.properties"))
         .with_context(|| format!("reading {}/server.properties", dir.display()))?;
     if properties::get(&text, "enable-rcon") != Some("true") {
-        bail!("RCON is off for this server; `hopper service install` turns it on");
+        match unit {
+            // hopper turned it on, so something else turned it off.
+            Some(_) => bail!(
+                "RCON is off in server.properties, though `hopper service install` turned it on.\n\
+                 Something rewrote the file, often a pack applying its default settings on first\n\
+                 start. Run `hopper service install` again, then restart the server."
+            ),
+            None => bail!("RCON is off for this server; `hopper service install` turns it on"),
+        }
     }
-    let port: u16 = properties::get(&text, "rcon.port")
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(25575);
-    let password = properties::get(&text, "rcon.password").unwrap_or_default();
-    let host = properties::get(&text, "server-ip")
-        .filter(|h| !h.is_empty())
-        .unwrap_or("127.0.0.1");
+    Ok(RconTarget {
+        port: properties::get(&text, "rcon.port")
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(25575),
+        password: properties::get(&text, "rcon.password")
+            .unwrap_or_default()
+            .to_owned(),
+        host: properties::get(&text, "server-ip")
+            .filter(|h| !h.is_empty())
+            .unwrap_or("127.0.0.1")
+            .to_owned(),
+    })
+}
 
-    let mut rcon = Rcon::connect((host, port), password)
-        .with_context(|| format!("connecting to {host}:{port}; is the server running?"))?;
+/// Connect, waiting while the service is still starting: RCON only opens once the world has
+/// loaded, which takes minutes for a large pack.
+fn connect_waiting(dir: &Path) -> Result<Rcon> {
+    use hopper_core::server::rcon::RconError;
+
+    let unit = unit_for(dir);
+    let target = rcon_target(dir, unit.as_deref())?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15 * 60);
+    let mut said = false;
+    loop {
+        match Rcon::connect((target.host.as_str(), target.port), &target.password) {
+            Ok(r) => return Ok(r),
+            Err(RconError::Connect(e)) => {
+                let state = unit
+                    .as_deref()
+                    .and_then(|u| unit_property(u, "ActiveState"))
+                    .unwrap_or_default();
+                let up = state == "active" || state == "activating" || state == "reloading";
+                if !up || std::time::Instant::now() > deadline {
+                    let how = match &unit {
+                        Some(u) => format!(
+                            "start it with `systemctl --user start {u}`; logs: `journalctl --user -u {u}`"
+                        ),
+                        None => "start it, or run `hopper service install --now`".to_owned(),
+                    };
+                    bail!(
+                        "the server is not running ({}:{}: {e}); {how}",
+                        target.host,
+                        target.port
+                    );
+                }
+                if !said {
+                    eprintln!(
+                        "Waiting for the server to finish starting (large packs take a few minutes)..."
+                    );
+                    said = true;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// `hopper console`: one command from the arguments, or an interactive prompt.
+pub fn console(dir: &Path, command: &[String]) -> Result<i32> {
+    let mut rcon = connect_waiting(dir)?;
+    let (host, port) = {
+        let t = rcon_target(dir, None).ok();
+        t.map(|t| (t.host, t.port)).unwrap_or_default()
+    };
 
     if !command.is_empty() {
         let out = rcon.command(&command.join(" "))?;

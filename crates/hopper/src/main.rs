@@ -27,10 +27,23 @@ mod render;
 mod runtime;
 mod selfupdate;
 mod service;
+mod show;
 
 use cli::{Cli, Command, exit};
 
 fn main() {
+    // `hopper logs` hands everything after it to journalctl untouched. Parsed here, before
+    // clap, because hopper's own global flags (-n, -q, -v) would otherwise claim journalctl's.
+    if let Some((dir, args)) = logs_invocation(std::env::args().skip(1).collect()) {
+        let code = match service::logs(&dir, &args) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                exit::GENERIC
+            }
+        };
+        std::process::exit(code);
+    }
     let cli = Cli::parse();
     let code = match run(&cli) {
         Ok(code) => code,
@@ -43,6 +56,27 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+/// `[--dir DIR | -d DIR | --dir=DIR] logs ARGS...` -> (dir, ARGS).
+fn logs_invocation(args: Vec<String>) -> Option<(PathBuf, Vec<String>)> {
+    let mut dir = PathBuf::from(".");
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "logs" => return Some((dir, args[i + 1..].to_vec())),
+            "-d" | "--dir" => {
+                dir = PathBuf::from(args.get(i + 1)?);
+                i += 2;
+            }
+            a if a.starts_with("--dir=") => {
+                dir = PathBuf::from(&a["--dir=".len()..]);
+                i += 1;
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Map a failure to an exit code, so scripts can tell "try again later" from "this is
@@ -150,6 +184,8 @@ async fn run(cli: &Cli) -> Result<i32> {
             cli::ServiceAction::StopServer { dir, pid } => service::stop_server(dir, *pid),
         },
         Some(Command::Console { command }) => service::console(root, command),
+        Some(Command::Show { plain }) => show::run(root, *plain),
+        Some(Command::Logs { args }) => service::logs(root, args),
         Some(Command::Completions { shell }) => {
             let mut cmd = <Cli as clap::CommandFactory>::command();
             let mut script = Vec::new();
@@ -630,6 +666,14 @@ async fn finish_install(
     };
 
     let mut desired = resolved.desired.clone();
+    // The pack's default-server.properties seeds server.properties below rather than being
+    // installed, so no mod can replace the operator's settings with it on first start.
+    let defaults_path =
+        RelPath::parse(hopper_core::server::PACK_DEFAULT_PROPERTIES).expect("a constant path");
+    let pack_defaults = desired.remove(&defaults_path).and_then(|f| {
+        let blob = store.get(&f.content).ok().flatten()?;
+        std::fs::read_to_string(blob.path).ok()
+    });
     let mut installer_pending = false;
     if let Some((rt, _)) = &runtime {
         for f in &rt.files {
@@ -831,17 +875,22 @@ async fn finish_install(
     let _ = instances::register(root);
     let props = root.join("server.properties");
     if !props.exists() {
-        let port = instances::pick_server_port(root);
+        // The pack's own port preference, if it has one, is where the search starts.
+        let wanted = pack_defaults
+            .as_deref()
+            .and_then(|d| hopper_core::server::properties::get(d, "server-port"))
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(hopper_core::server::ports::DEFAULT_SERVER_PORT);
+        let port = instances::pick_server_port_from(root, wanted);
         hfs::write_atomic(
             &props,
-            hopper_core::server::default_server_properties(port).as_bytes(),
+            hopper_core::server::seed_server_properties(pack_defaults.as_deref(), port).as_bytes(),
             false,
         )
         .context("seeding server.properties")?;
-        if port != hopper_core::server::ports::DEFAULT_SERVER_PORT && !cli.global.quiet {
+        if port != wanted && !cli.global.quiet {
             println!(
-                "\n  Port {} is in use or belongs to another server here, so this one uses {port}.",
-                hopper_core::server::ports::DEFAULT_SERVER_PORT
+                "\n  Port {wanted} is in use or belongs to another server here, so this one uses {port}."
             );
         }
     }
@@ -868,9 +917,7 @@ async fn finish_install(
         println!("  Update later:  hopper");
         println!("  What's here:   hopper status");
         if !eula_accepted(root) {
-            println!("\n  note: the Minecraft EULA has not been accepted, so the server");
-            println!("        will not start. Accept it with:  hopper --eula");
-            println!("        {}", hopper_core::server::EULA_URL);
+            offer_eula(root, cli.global.yes)?;
         }
     }
 
@@ -1403,6 +1450,37 @@ fn accept_eula(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Ask the operator to accept the EULA, when there is an operator to ask.
+///
+/// Never assumed: `--yes` and non-interactive runs only explain how, since agreeing to a
+/// licence on someone's behalf because they skipped prompts is not defensible. Only an explicit
+/// answer of yes accepts.
+fn offer_eula(root: &Path, yes: bool) -> Result<bool> {
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    if yes || !interactive {
+        println!("\n  note: the Minecraft EULA has not been accepted, so the server");
+        println!("        will not start. Accept it with:  hopper --eula");
+        println!("        {}", hopper_core::server::EULA_URL);
+        return Ok(false);
+    }
+    println!(
+        "\nThe server only starts once you accept the Minecraft EULA:\n  {}",
+        hopper_core::server::EULA_URL
+    );
+    print!("Do you accept it? [y/N] ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    if matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        accept_eula(root)?;
+        println!("  Accepted.");
+        Ok(true)
+    } else {
+        println!("  Not accepted. When you are ready:  hopper --eula");
+        Ok(false)
+    }
+}
+
 fn eula_accepted(root: &Path) -> bool {
     hfs::read_optional(&root.join("eula.txt"))
         .ok()
@@ -1505,6 +1583,21 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn logs_arguments_pass_through_untouched() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (dir, args) = super::logs_invocation(v(&["logs", "-n", "3", "-f"])).unwrap();
+        assert_eq!(dir, std::path::PathBuf::from("."));
+        assert_eq!(args, ["-n", "3", "-f"]);
+        let (dir, args) = super::logs_invocation(v(&["-d", "/srv/mc", "logs", "-q"])).unwrap();
+        assert_eq!(dir, std::path::PathBuf::from("/srv/mc"));
+        assert_eq!(args, ["-q"]);
+        assert!(super::logs_invocation(v(&["--dir=/x", "logs"])).is_some());
+        // Anything else is hopper's to parse.
+        assert!(super::logs_invocation(v(&["-n", "logs"])).is_none());
+        assert!(super::logs_invocation(v(&["adrenaserver"])).is_none());
+    }
+
     fn runtime() -> super::runtime::Runtime {
         super::runtime::Runtime {
             files: vec![],

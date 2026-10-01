@@ -9,6 +9,7 @@ hopper cf:deceasedcraft      # a CurseForge pack (needs an API key, see below)
 hopper                       # update whatever is installed here
 hopper -n                    # check for updates, change nothing
 hopper status                # what's installed
+hopper show                  # the server at a glance: status, players, address to share
 ```
 
 ## Install
@@ -126,12 +127,16 @@ This writes systemd **user** units, so no root is needed, and enables them:
 Then:
 
 ```sh
-hopper console list               # one command over RCON
+hopper show                       # status, uptime, MOTD, players, version, address
+hopper console list               # one command over RCON (waits if the server is starting)
 hopper console                    # interactive; Ctrl-D to leave
-journalctl --user -u hopper-<dir> -f
+hopper logs -f                    # journalctl for this server; flags pass straight through
 systemctl --user restart hopper-<dir>
 hopper service remove             # stop and delete the units; the server is untouched
 ```
+
+`hopper show` prints the address as `ip:port` and `host:port` on lines of their own, ready to
+paste into the game. Piped, or with `--plain`, it prints plain `key: value` lines.
 
 User services stop when you log out and don't start at boot unless lingering is on
 (`loginctl enable-linger`); `service install` tells you if it isn't. `--name` picks a unit name
@@ -147,6 +152,8 @@ other than the directory's.
 | `hopper repair` | finish an interrupted update (rarely needed) |
 | `hopper service install` / `remove` | run the server under systemd --user |
 | `hopper console [cmd]` | send a command to the running server over RCON |
+| `hopper show` | the server at a glance, with the address to share |
+| `hopper logs [journalctl flags]` | the server's log |
 | `hopper self-update` | update hopper to the latest release |
 | `hopper completions <shell>` | print a shell completion script |
 
@@ -154,7 +161,8 @@ Useful flags: `-d/--dir`, `-y/--yes`, `-n/--dry-run`, `--eula`, `--mc`, `--loade
 `--mods-only`, `--no-optional`, `--force-include`/`--force-exclude`, `--java`, `--java-vendor`,
 `--cf-api-key`, `--allow-client-pack`, `--skip-blocked`.
 
-`--yes` deliberately does **not** accept the Minecraft EULA. `--eula` is separate, because
+An interactive install asks whether you accept the Minecraft EULA; only an explicit `y` does.
+`--yes` deliberately does **not** accept it. `--eula` is separate, because
 agreeing to a licence on your behalf because you skipped a prompt is not defensible.
 
 `--dry-run` exits `10` when changes are pending and `0` when current, so it works as a cron
@@ -178,6 +186,9 @@ that list. Security refusals exit `5`, transient network failures `4`.
   refused; inside JDK archives, where they are legitimate, each is checked to stay inside.
 - `world/`, `logs/` and ban lists are never written or deleted. Neither is `server.properties`,
   except by `hopper service install`, which changes only the three RCON settings.
+- A pack's `default-server.properties` seeds `server.properties` on first install instead of
+  being installed itself. Installed, a mod some packs carry would replace your
+  `server.properties` with it on first start, discarding RCON and the chosen port.
 - `ops.json`, `whitelist.json`, the ban lists and `usercache.json` are never installed from a
   pack, even into an empty directory: an author's `ops.json` would make them an operator on
   your server.
@@ -196,7 +207,7 @@ that list. Security refusals exit `5`, transient network failures `4`.
 
 ```sh
 cargo build --release          # target/release/hopper, ~4MB
-cargo test                     # 535 tests, no network needed
+cargo test                     # 543 tests, no network needed
 ```
 
 ### A static binary for servers

@@ -69,6 +69,28 @@ fn checksum_for(sums: &str, name: &str) -> Option<Digest> {
     })
 }
 
+/// How long one download may take before it is reported as stalled. A release is a few
+/// megabytes; two minutes is generous on any connection that is actually moving.
+const STEP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Run a download with a deadline, naming it in the error either way.
+async fn within<T>(
+    deadline: std::time::Duration,
+    what: &str,
+    fut: impl std::future::Future<Output = Result<T, hopper_core::net::HttpError>>,
+) -> Result<T> {
+    match tokio::time::timeout(deadline, fut).await {
+        Ok(result) => result.with_context(|| format!("downloading {what}")),
+        Err(_) => bail!(
+            "downloading {what} got no answer for {}s.\n\
+             help: check that this machine can reach github.com and\n\
+             release-assets.githubusercontent.com, e.g.\n\
+             curl -sSL -o /dev/null -w '%{{http_code}}\\n' https://github.com/{REPO}/releases/latest",
+            deadline.as_secs()
+        ),
+    }
+}
+
 pub async fn run(opts: &Options<'_>) -> Result<i32> {
     let current = env!("CARGO_PKG_VERSION");
     // The API and the download both live on GitHub; assets redirect to its asset host, which
@@ -134,18 +156,27 @@ pub async fn run(opts: &Options<'_>) -> Result<i32> {
         return Ok(exit::DECLINED);
     }
 
-    let sums = client
-        .get_bytes(&sums_url)
-        .await
-        .context("downloading SHA256SUMS")?;
+    // Each step says what it is doing and gives up after a deadline: a stalled connection must
+    // read as an error naming what stalled, not as a hang after "yes".
+    let say = |msg: &str| {
+        if !opts.quiet {
+            println!("{msg}");
+        }
+    };
+    say("Downloading SHA256SUMS...");
+    let sums = within(STEP_DEADLINE, "SHA256SUMS", client.get_bytes(&sums_url)).await?;
     let Some(expect) = checksum_for(&String::from_utf8_lossy(&sums), &name) else {
         bail!("SHA256SUMS in release {latest} does not list {name}");
     };
+    say(&format!("Downloading {name}..."));
     let store = BlobStore::new(opts.cache);
-    let blob = client
-        .fetch_to_store(std::slice::from_ref(&tarball), Some(&expect), None, &store)
-        .await
-        .with_context(|| format!("downloading {name}"))?;
+    let blob = within(
+        STEP_DEADLINE,
+        &name,
+        client.fetch_to_store(std::slice::from_ref(&tarball), Some(&expect), None, &store),
+    )
+    .await?;
+    say("Verified; installing...");
 
     // Unpacked next to the binary, so the final rename stays on one filesystem.
     let staging = dir.join(format!(".hopper-update-{}", std::process::id()));
@@ -184,6 +215,20 @@ pub async fn run(opts: &Options<'_>) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_stalled_download_becomes_an_error_naming_it() {
+        let stalled = std::future::pending::<Result<(), hopper_core::net::HttpError>>();
+        let err = within(std::time::Duration::from_millis(50), "SHA256SUMS", stalled)
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("SHA256SUMS"), "{text}");
+        assert!(
+            text.contains("release-assets.githubusercontent.com"),
+            "{text}"
+        );
+    }
 
     #[test]
     fn versions_compare_numerically() {

@@ -209,7 +209,7 @@ that list. Security refusals exit `5`, transient network failures `4`.
 
 ```sh
 cargo build --release          # target/release/hopper, ~4MB
-cargo test                     # 547 tests, no network needed
+cargo test                     # 548 tests, no network needed
 ```
 
 ### A static binary for servers

@@ -87,6 +87,19 @@ pub enum Command {
         force: bool,
     },
 
+    /// Run this server under systemd --user
+    #[command(subcommand)]
+    Service(ServiceAction),
+
+    /// Send a command to the running server over RCON, or open an interactive console
+    ///
+    /// `hopper service install` turns RCON on. With no command, reads commands line by line.
+    Console {
+        /// The server command, e.g. `list` or `say hello`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+
     /// Print a shell completion script
     ///
     /// For example: hopper completions bash > ~/.local/share/bash-completion/completions/hopper
@@ -207,6 +220,54 @@ pub struct InstallArgs {
     /// Leave out files whose authors disabled third-party downloads, instead of stopping
     #[arg(long)]
     pub skip_blocked: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServiceAction {
+    /// Write and enable systemd user units for the server in --dir
+    ///
+    /// Also turns on RCON (random password, server.properties made private) so `hopper
+    /// console` can reach the server. Safe to re-run: units are rewritten, settings kept.
+    Install {
+        /// Unit name [default: the directory's name] -> hopper-<name>.service
+        #[arg(long)]
+        name: Option<String>,
+        /// Update schedule: off, hourly, daily, weekly, or a systemd OnCalendar expression
+        ///
+        /// When it fires and the pack has changes, the server is stopped, updated and started
+        /// again. Omit to keep this installation's current schedule.
+        #[arg(long, value_name = "SCHEDULE")]
+        update: Option<String>,
+        /// Start (or restart) the server now
+        #[arg(long)]
+        now: bool,
+    },
+    /// Stop the server and remove its units; the server directory is untouched
+    Remove {
+        /// Unit name, if one was given at install
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Ask the server to stop over RCON and wait for it to exit
+    ///
+    /// What the server unit's ExecStop runs.
+    #[command(hide = true)]
+    StopServer {
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long)]
+        pid: u32,
+    },
+    /// Check for and apply an update, stopping and starting the server around it
+    ///
+    /// What the update timer runs.
+    #[command(hide = true)]
+    RunUpdate {
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long)]
+        unit: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

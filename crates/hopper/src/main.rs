@@ -25,6 +25,7 @@ mod curseforge;
 mod render;
 mod runtime;
 mod selfupdate;
+mod service;
 
 use cli::{Cli, Command, exit};
 
@@ -131,6 +132,23 @@ async fn run(cli: &Cli) -> Result<i32> {
             })
             .await
         }
+        Some(Command::Service(action)) => match action {
+            cli::ServiceAction::Install { name, update, now } => {
+                service::install(&service::InstallOptions {
+                    dir: root,
+                    name: name.as_deref(),
+                    update: update.as_deref(),
+                    now: *now,
+                    quiet: cli.global.quiet,
+                })
+            }
+            cli::ServiceAction::Remove { name } => {
+                service::remove(root, name.as_deref(), cli.global.quiet)
+            }
+            cli::ServiceAction::RunUpdate { dir, unit } => service::run_update(dir, unit),
+            cli::ServiceAction::StopServer { dir, pid } => service::stop_server(dir, *pid),
+        },
+        Some(Command::Console { command }) => service::console(root, command),
         Some(Command::Completions { shell }) => {
             let mut cmd = <Cli as clap::CommandFactory>::command();
             let mut script = Vec::new();
@@ -416,7 +434,8 @@ async fn install(cli: &Cli) -> Result<i32> {
             }
         }
         _ => {
-            let archive = match load_archive(&spec, &client, &source_arg, wanted_mc.as_ref()).await
+            let archive = match load_archive(&spec, &client, cli.global.quiet, wanted_mc.as_ref())
+                .await
             {
                 Ok(a) => a,
                 // A bare slug Modrinth does not know may be a CurseForge pack.
@@ -831,10 +850,9 @@ async fn finish_install(
 async fn load_archive(
     spec: &SourceSpec,
     client: &HttpClient,
-    source_arg: &str,
+    quiet: bool,
     mc: Option<&MinecraftVersion>,
 ) -> Result<Vec<u8>> {
-    let _ = source_arg;
     let bytes = match spec {
         SourceSpec::File { path } => {
             hfs::read(Path::new(path)).with_context(|| format!("reading {path}"))?
@@ -844,11 +862,11 @@ async fn load_archive(
             .await
             .with_context(|| format!("downloading {url}"))?,
         SourceSpec::Pack { slug, version } => {
-            fetch_from_registry(client, slug, version.as_deref(), mc).await?
+            fetch_from_registry(client, slug, version.as_deref(), mc, quiet).await?
         }
         // A bare token is resolved as a pack first; collections come later.
         SourceSpec::Ambiguous { token, version } => {
-            fetch_from_registry(client, token, version.as_deref(), mc).await?
+            fetch_from_registry(client, token, version.as_deref(), mc, quiet).await?
         }
         SourceSpec::Collection { .. } | SourceSpec::CurseForge { .. } => {
             unreachable!("handled before load_archive")
@@ -866,6 +884,7 @@ async fn fetch_from_registry(
     slug: &str,
     version: Option<&str>,
     mc: Option<&MinecraftVersion>,
+    quiet: bool,
 ) -> Result<Vec<u8>> {
     use hopper_core::api::client as registry;
 
@@ -880,10 +899,12 @@ async fn fetch_from_registry(
     let chosen = registry::choose_version(&versions, slug, version, mc)?;
     let pack = registry::pack_file(&chosen, slug)?;
 
-    if !matches!(
-        pack.version_type,
-        Some(hopper_core::api::modrinth::VersionType::Release) | None
-    ) {
+    if !quiet
+        && !matches!(
+            pack.version_type,
+            Some(hopper_core::api::modrinth::VersionType::Release) | None
+        )
+    {
         // Worth saying out loud: the operator asked for a pack and is getting a prerelease
         // because no stable version exists.
         println!(

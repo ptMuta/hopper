@@ -95,6 +95,41 @@ Some authors disable third-party downloads of their mods. hopper lists any such 
 server needs, with links, and stops. Download them into `mods/` yourself and re-run with
 `--skip-blocked`; as files hopper did not install, they survive every update.
 
+## Running it as a service
+
+```sh
+hopper service install --now --update daily    # in the server directory, or with --dir
+```
+
+This writes systemd **user** units, so no root is needed, and enables them:
+
+- `hopper-<dir>.service` runs `start.sh`, restarts after a crash, and stops the way an
+  operator would: `stop` over RCON, then waits until the world is saved. If RCON isn't
+  reachable, it falls back to SIGTERM.
+- With `--update <schedule>`, `hopper-<dir>-update.timer` checks for pack updates. Only when
+  something changed does it stop the server, apply the update and start it again; a server you
+  stopped yourself stays stopped. The schedule is `hourly`, `daily`, `weekly` (both at 04:00),
+  `off`, or any systemd `OnCalendar` expression, and belongs to that installation: re-run
+  `service install` with a new `--update` to change it. A CurseForge pack's API key is copied
+  to `~/.config/hopper/env` (readable only by you) for the timer to use.
+- RCON is turned on in `server.properties` with a random 32-character password, on a free port
+  from 25575, and the file is made readable only by you. RCON listens on every interface unless
+  `server-ip` is set, so keep that port closed in your firewall.
+
+Then:
+
+```sh
+hopper console list               # one command over RCON
+hopper console                    # interactive; Ctrl-D to leave
+journalctl --user -u hopper-<dir> -f
+systemctl --user restart hopper-<dir>
+hopper service remove             # stop and delete the units; the server is untouched
+```
+
+User services stop when you log out and don't start at boot unless lingering is on
+(`loginctl enable-linger`); `service install` tells you if it isn't. `--name` picks a unit name
+other than the directory's.
+
 ## Commands
 
 | | |
@@ -103,6 +138,8 @@ server needs, with links, and stops. Download them into `mods/` yourself and re-
 | `hopper status` | what's installed here |
 | `hopper disable <mod>` / `enable <mod>` | turn a mod off without removing it |
 | `hopper repair` | finish an interrupted update (rarely needed) |
+| `hopper service install` / `remove` | run the server under systemd --user |
+| `hopper console [cmd]` | send a command to the running server over RCON |
 | `hopper self-update` | update hopper to the latest release |
 | `hopper completions <shell>` | print a shell completion script |
 
@@ -132,7 +169,8 @@ that list. Security refusals exit `5`, transient network failures `4`.
   names itself.
 - Pack entry paths cannot escape the install directory. Symlinks inside pack archives are
   refused; inside JDK archives, where they are legitimate, each is checked to stay inside.
-- `world/`, `logs/`, ban lists and `server.properties` are never written or deleted.
+- `world/`, `logs/` and ban lists are never written or deleted. Neither is `server.properties`,
+  except by `hopper service install`, which changes only the three RCON settings.
 - `ops.json`, `whitelist.json`, the ban lists and `usercache.json` are never installed from a
   pack, even into an empty directory: an author's `ops.json` would make them an operator on
   your server.
@@ -151,7 +189,7 @@ that list. Security refusals exit `5`, transient network failures `4`.
 
 ```sh
 cargo build --release          # target/release/hopper, ~4MB
-cargo test                     # 516 tests, no network needed
+cargo test                     # 530 tests, no network needed
 ```
 
 ### A static binary for servers

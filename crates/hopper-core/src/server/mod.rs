@@ -5,6 +5,10 @@
 //! loader — which is the only way to hide the Fabric-launch-jar versus NeoForge-argfile split
 //! from the operator.
 
+pub mod properties;
+pub mod rcon;
+pub mod systemd;
+
 use crate::java::JavaVendor;
 use crate::loader::LaunchProfile;
 use crate::model::RelPath;
@@ -157,26 +161,6 @@ fn quote_sh(s: &str) -> String {
         return s.to_owned();
     }
     format!("'{}'", s.replace('\'', r"'\''"))
-}
-
-/// A systemd unit the operator can paste.
-///
-/// Printed, never written: creating files under `/etc` is not something a modpack installer
-/// should do on its own.
-pub fn systemd_unit_hint(dir: &str, user: &str) -> String {
-    format!(
-        "[Unit]\n\
-         Description=Minecraft server ({dir})\n\
-         After=network.target\n\n\
-         [Service]\n\
-         Type=simple\n\
-         User={user}\n\
-         WorkingDirectory={dir}\n\
-         ExecStart={dir}/start.sh\n\
-         Restart=on-failure\n\n\
-         [Install]\n\
-         WantedBy=multi-user.target\n"
-    )
 }
 
 #[cfg(test)]
@@ -354,14 +338,5 @@ mod tests {
             "0.1.0",
         );
         assert!(s.contains("system JVM at /usr/bin/java"));
-    }
-
-    #[test]
-    fn the_systemd_unit_points_at_the_start_script() {
-        let u = systemd_unit_hint("/srv/mc", "mc");
-        assert!(u.contains("ExecStart=/srv/mc/start.sh"));
-        assert!(u.contains("WorkingDirectory=/srv/mc"));
-        assert!(u.contains("Restart=on-failure"));
-        assert!(u.contains("User=mc"));
     }
 }

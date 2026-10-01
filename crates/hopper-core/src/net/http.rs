@@ -66,7 +66,10 @@ impl HttpError {
 #[derive(Clone)]
 pub struct HttpClient {
     inner: reqwest::Client,
-    gate: Arc<Mutex<RateGate>>,
+    /// One budget per host: a rate limit belongs to the API that reported it. GitHub's API
+    /// quota says nothing about github.com downloads, and pacing those by it stalled
+    /// `self-update` for minutes.
+    gates: Arc<Mutex<std::collections::HashMap<String, RateGate>>>,
     retry: RetryPolicy,
     clock: Arc<dyn Clock>,
     allow: Arc<HostAllowlist>,
@@ -152,7 +155,7 @@ impl HttpClient {
 
         Ok(Self {
             inner,
-            gate: Arc::new(Mutex::new(RateGate::new())),
+            gates: Arc::new(Mutex::new(std::collections::HashMap::new())),
             retry: RetryPolicy::default(),
             clock: Arc::new(SystemClock::default()),
             allow,
@@ -174,28 +177,36 @@ impl HttpClient {
         &self.allow
     }
 
-    /// Wait until the rate gate says a request may go out.
-    async fn await_budget(&self) {
+    /// Wait until `url`'s host may be sent another request.
+    async fn await_budget(&self, url: &url::Url) {
+        let host = url.host_str().unwrap_or_default();
         let delay = {
-            let gate = self.gate.lock().expect("rate gate poisoned");
-            gate.delay_before_next(self.clock.now_ms())
+            let gates = self.gates.lock().expect("rate gate poisoned");
+            gates
+                .get(host)
+                .map(|g| g.delay_before_next(self.clock.now_ms()))
+                .unwrap_or_default()
         };
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
     }
 
-    fn observe(&self, headers: &reqwest::header::HeaderMap, status: u16) {
+    /// Record what a response said about its own host's budget.
+    fn observe(&self, resp: &reqwest::Response) {
+        let headers = resp.headers();
         let num = |name: &str| -> Option<u64> { headers.get(name)?.to_str().ok()?.parse().ok() };
         let now = self.clock.now_ms();
-        let mut gate = self.gate.lock().expect("rate gate poisoned");
+        let host = resp.url().host_str().unwrap_or_default().to_owned();
+        let mut gates = self.gates.lock().expect("rate gate poisoned");
+        let gate = gates.entry(host).or_default();
         gate.observe(
             num("x-ratelimit-limit").map(|n| n as u32),
             num("x-ratelimit-remaining").map(|n| n as u32),
             num("x-ratelimit-reset"),
             now,
         );
-        if status == 429 {
+        if resp.status().as_u16() == 429 {
             gate.throttled(num("retry-after"), now);
         }
     }
@@ -232,13 +243,13 @@ impl HttpClient {
 
         let mut last = String::new();
         for attempt in 0..self.retry.max_attempts {
-            self.await_budget().await;
+            self.await_budget(&parsed).await;
 
             let result = self.inner.get(parsed.clone()).send().await;
             let (status, retryable, body) = match result {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
-                    self.observe(resp.headers(), status);
+                    self.observe(&resp);
                     if resp.status().is_success() {
                         match resp.bytes().await {
                             Ok(b) => return Ok(b.to_vec()),
@@ -310,12 +321,12 @@ impl HttpClient {
 
         let mut last = String::new();
         for attempt in 0..self.retry.max_attempts {
-            self.await_budget().await;
+            self.await_budget(&parsed).await;
 
             match self.inner.post(parsed.clone()).json(body).send().await {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
-                    self.observe(resp.headers(), status);
+                    self.observe(&resp);
                     if resp.status().is_success() {
                         return resp.json().await.map_err(|e| HttpError::Transport {
                             url: url.to_owned(),
@@ -378,7 +389,7 @@ impl HttpClient {
                 source,
             })?;
 
-        self.await_budget().await;
+        self.await_budget(&parsed).await;
         let resp = self.inner.get(parsed).send().await.map_err(|e| {
             Self::refused_redirect(url, &e).unwrap_or_else(|| HttpError::Transport {
                 url: url.to_owned(),
@@ -387,7 +398,7 @@ impl HttpClient {
         })?;
 
         let status = resp.status().as_u16();
-        self.observe(resp.headers(), status);
+        self.observe(&resp);
         if !resp.status().is_success() {
             return Err(HttpError::Status {
                 url: url.to_owned(),

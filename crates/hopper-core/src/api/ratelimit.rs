@@ -50,6 +50,25 @@ pub struct Budget {
     pub reset_at_ms: u64,
 }
 
+/// No rate window hopper talks to is longer than this (GitHub's is an hour), so no header may
+/// make it wait longer. A misread header must cost a pause, never a hang.
+pub const MAX_WINDOW_S: u64 = 3600;
+
+/// Seconds until the window resets, from an `X-RateLimit-Reset` value.
+///
+/// The header means different things to different APIs: Modrinth sends seconds remaining,
+/// GitHub sends the reset moment as a Unix timestamp. A value that can only be a timestamp
+/// (later than 2001) is converted; either way the result is capped at [`MAX_WINDOW_S`].
+pub fn reset_seconds(value: Option<u64>, now_ms: u64) -> u64 {
+    const TIMESTAMP_FLOOR: u64 = 1_000_000_000;
+    let secs = match value {
+        None => 60,
+        Some(v) if v >= TIMESTAMP_FLOOR => v.saturating_sub(now_ms / 1000),
+        Some(v) => v,
+    };
+    secs.min(MAX_WINDOW_S)
+}
+
 /// Tracks the remaining budget and says how long to wait before the next request.
 #[derive(Debug)]
 pub struct RateGate {
@@ -97,7 +116,7 @@ impl RateGate {
             self.budget = Some(Budget {
                 limit,
                 remaining,
-                reset_at_ms: now_ms + reset_in_s.unwrap_or(60) * 1000,
+                reset_at_ms: now_ms + reset_seconds(reset_in_s, now_ms) * 1000,
             });
         }
     }
@@ -201,6 +220,32 @@ impl RetryPolicy {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_reset_timestamp_is_not_read_as_a_duration() {
+        // GitHub: reset at a Unix timestamp 30 minutes from now, 19 requests left. Read as a
+        // duration this paced the next request about three years out, which is the hang
+        // `hopper self-update` hit on a shared IP.
+        let now_ms = 1_790_890_405_000 - 1_800_000;
+        let mut gate = RateGate::new();
+        gate.observe(Some(60), Some(19), Some(1_790_890_405), now_ms);
+        let wait = gate.delay_before_next(now_ms);
+        assert!(wait <= Duration::from_secs(1800 / 19 + 1), "{wait:?}");
+        assert!(wait > Duration::ZERO);
+    }
+
+    #[test]
+    fn modrinth_style_seconds_still_work_and_everything_is_capped() {
+        assert_eq!(reset_seconds(Some(42), 0), 42);
+        assert_eq!(reset_seconds(None, 0), 60);
+        // A timestamp in the past means the window already reset.
+        assert_eq!(reset_seconds(Some(1_000_000_500), 2_000_000_000_000), 0);
+        // Nothing waits beyond the longest real window.
+        assert_eq!(reset_seconds(Some(999_999_999), 0), MAX_WINDOW_S);
+        let mut gate = RateGate::new();
+        gate.observe(Some(60), Some(0), Some(999_999_999), 0);
+        assert!(gate.delay_before_next(0) <= Duration::from_secs(MAX_WINDOW_S));
+    }
+
     use super::*;
 
     #[test]

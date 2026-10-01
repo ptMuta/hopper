@@ -492,6 +492,7 @@ mod tests {
                 name: "T".into(),
                 version_label: None,
                 source_arg: "t".into(),
+                ..Default::default()
             },
             policy: PolicyRecord::default(),
             files: vec![],

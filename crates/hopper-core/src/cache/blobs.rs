@@ -142,7 +142,6 @@ impl BlobStore {
                 out.write_all(&buf[..n])
                     .map_err(|e| IoPath::new("write", &tmp, e))?;
             }
-            out.sync_all().map_err(|e| IoPath::new("sync", &tmp, e))?;
         }
 
         let (hashes, digest) = hasher.finish();
@@ -186,15 +185,29 @@ impl BlobStore {
             hfs::create_dir_all(parent).map_err(|e| fail(e.into()))?;
         }
 
-        // A concurrent writer may have published the same content first. That is fine: the
-        // content is identical by construction, so whoever loses simply drops their copy.
+        // Already stored -- by an earlier run, or a concurrent writer that got there first.
+        // The content is identical by construction, so the copy is simply dropped. Checked
+        // before syncing: re-staging a large pack whose content is all cached would otherwise
+        // pay one fsync per file for data that is thrown away.
         if final_path.is_file() {
             let _ = std::fs::remove_file(&tmp);
         } else {
+            std::fs::File::open(&tmp)
+                .and_then(|f| f.sync_all())
+                .map_err(|e| fail(IoPath::new("sync", &tmp, e).into()))?;
             hfs::rename(&tmp, &final_path).map_err(|e| fail(e.into()))?;
             if let Some(parent) = final_path.parent() {
                 hfs::fsync_dir(parent)?;
             }
+        }
+
+        // Remember which sha512 a weaker verified digest maps to, so the next fetch by that
+        // digest is a cache hit. Only written after verification passed, so an alias never
+        // points at content that did not match. Losing one only costs a re-download.
+        if let Some(expected) = expect
+            && expected.algo() != HashAlgo::Sha512
+        {
+            let _ = self.write_alias(expected, &digest);
         }
 
         Ok(Blob {
@@ -203,6 +216,42 @@ impl BlobStore {
             size,
             hashes,
         })
+    }
+
+    fn alias_path(&self, weak: &Digest) -> PathBuf {
+        let (a, b) = weak.shard();
+        self.root
+            .join("alias")
+            .join(weak.algo().name())
+            .join(a)
+            .join(b)
+            .join(weak.hex())
+    }
+
+    fn write_alias(&self, weak: &Digest, strong: &Digest) -> Result<(), BlobError> {
+        let path = self.alias_path(weak);
+        if let Some(parent) = path.parent() {
+            hfs::create_dir_all(parent)?;
+        }
+        hfs::write_atomic(&path, strong.hex().as_bytes(), false)?;
+        Ok(())
+    }
+
+    /// Look a blob up by a digest it was verified against, sha1 or sha256 included.
+    ///
+    /// Registries that publish only sha1 (CurseForge, Mojang) would otherwise miss the cache
+    /// on every run, since blobs are addressed by sha512.
+    pub fn get_verified(&self, digest: &Digest) -> Result<Option<Blob>, BlobError> {
+        if digest.algo() == HashAlgo::Sha512 {
+            return self.get(digest);
+        }
+        let Ok(hex) = std::fs::read_to_string(self.alias_path(digest)) else {
+            return Ok(None);
+        };
+        match Digest::new(HashAlgo::Sha512, hex.trim()) {
+            Ok(strong) => self.get(&strong),
+            Err(_) => Ok(None),
+        }
     }
 
     /// Copy a blob out to a destination path.
@@ -346,6 +395,25 @@ mod tests {
 
         let bad_sha1 = Digest::new(HashAlgo::Sha1, &"f".repeat(40)).unwrap();
         assert!(s.insert_bytes(b"payload", Some(&bad_sha1)).is_err());
+    }
+
+    #[test]
+    fn a_verified_sha1_finds_the_blob_again() {
+        let (_d, s) = store();
+        let sha1 = Digest::new(HashAlgo::Sha1, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d").unwrap();
+        assert_eq!(s.get_verified(&sha1).unwrap(), None);
+
+        let blob = s.insert_bytes(b"hello", Some(&sha1)).unwrap();
+        let again = s.get_verified(&sha1).unwrap().expect("aliased");
+        assert_eq!(again.digest, blob.digest);
+    }
+
+    #[test]
+    fn a_failed_verification_leaves_no_alias() {
+        let (_d, s) = store();
+        let sha1 = Digest::new(HashAlgo::Sha1, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d").unwrap();
+        assert!(s.insert_bytes(b"not hello", Some(&sha1)).is_err());
+        assert_eq!(s.get_verified(&sha1).unwrap(), None);
     }
 
     #[test]

@@ -39,6 +39,7 @@ fn template() -> Lockfile {
             name: "Test Pack".into(),
             version_label: Some("1.0.0".into()),
             source_arg: "test-pack".into(),
+            ..Default::default()
         },
         policy: PolicyRecord::default(),
         files: vec![],

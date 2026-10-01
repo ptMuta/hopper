@@ -1,6 +1,7 @@
 //! Talking to registries and metadata services.
 
 pub mod client;
+pub mod curseforge;
 pub mod modrinth;
 pub mod mojang;
 pub mod ratelimit;

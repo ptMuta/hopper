@@ -1,6 +1,6 @@
 [package]
 name = "hopper-mc"
-description = "Install and update Minecraft server modpacks from Modrinth."
+description = "Install and update Minecraft server modpacks from Modrinth and CurseForge."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,6 +16,7 @@ hopper-core = { path = "../hopper-core", version = "0.1.0" }
 clap.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

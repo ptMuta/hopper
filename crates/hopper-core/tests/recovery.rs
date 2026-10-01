@@ -78,6 +78,7 @@ fn lockfile(files: Vec<LockedFile>) -> Lockfile {
             name: "Test".into(),
             version_label: None,
             source_arg: "test".into(),
+            ..Default::default()
         },
         policy: PolicyRecord::default(),
         files,

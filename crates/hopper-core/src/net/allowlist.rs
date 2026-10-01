@@ -59,12 +59,22 @@ pub const RUNTIME_HOSTS: &[&str] = &[
     "download.oracle.com",
     "api.adoptium.net",
     "github.com",
+    // GitHub's release downloads redirect here; it replaced objects.githubusercontent.com,
+    // which is kept for older links.
+    "release-assets.githubusercontent.com",
     "objects.githubusercontent.com",
 ];
 
 /// Registry API hosts. Separate from [`PACK_HOSTS`] because an API that tells us what to
 /// download is a different concern from the hosts we will download from.
 pub const API_HOSTS: &[&str] = &["api.modrinth.com", "staging-api.modrinth.com"];
+
+/// CurseForge's API. Alone in its own list because requests to it carry the operator's API key,
+/// and a key-bearing client must not be able to follow a redirect anywhere else.
+pub const CURSEFORGE_API_HOSTS: &[&str] = &["api.curseforge.com"];
+
+/// Where CurseForge serves files from. Never sent the API key.
+pub const CURSEFORGE_CDN_HOSTS: &[&str] = &["edge.forgecdn.net", "mediafilez.forgecdn.net"];
 
 #[derive(Debug, Clone)]
 pub struct HostAllowlist {
@@ -86,6 +96,16 @@ impl HostAllowlist {
         let mut hosts: Vec<&str> = API_HOSTS.to_vec();
         hosts.extend_from_slice(PACK_HOSTS);
         Self::new("registry API", &hosts)
+    }
+
+    /// CurseForge's API host and nothing else. See [`CURSEFORGE_API_HOSTS`].
+    pub fn curseforge_api() -> Self {
+        Self::new("CurseForge API", CURSEFORGE_API_HOSTS)
+    }
+
+    /// CurseForge file downloads.
+    pub fn curseforge_files() -> Self {
+        Self::new("CurseForge downloads", CURSEFORGE_CDN_HOSTS)
     }
 
     pub fn new(domain: &'static str, hosts: &[&str]) -> Self {
@@ -140,6 +160,35 @@ mod tests {
 
     fn u(s: &str) -> Url {
         Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn the_key_bearing_curseforge_client_can_reach_only_the_api() {
+        let a = HostAllowlist::curseforge_api();
+        assert!(a.check(&u("https://api.curseforge.com/v1/mods/1")).is_ok());
+        // Its CDN is a different list: a redirect there from a keyed client must be refused.
+        assert!(
+            a.check(&u("https://edge.forgecdn.net/files/1/2/a.zip"))
+                .is_err()
+        );
+        assert!(a.check(&u("https://cdn.modrinth.com/x")).is_err());
+
+        let files = HostAllowlist::curseforge_files();
+        assert!(
+            files
+                .check(&u("https://edge.forgecdn.net/files/1/2/a.zip"))
+                .is_ok()
+        );
+        assert!(
+            files
+                .check(&u("https://mediafilez.forgecdn.net/files/1/2/a.zip"))
+                .is_ok()
+        );
+        assert!(
+            files
+                .check(&u("https://api.curseforge.com/v1/mods/1"))
+                .is_err()
+        );
     }
 
     #[test]

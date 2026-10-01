@@ -6,6 +6,7 @@
 //! leak into update, cleanup or launch.
 
 pub mod fabric;
+pub mod installer;
 pub mod launch;
 pub mod maven;
 pub mod versions;

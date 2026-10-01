@@ -6,7 +6,7 @@ members = ["crates/hopper-core", "crates/hopper"]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/ptMuta/hopper"
 
 [workspace.dependencies]
@@ -19,7 +19,7 @@ hex = "0.4"
 url = { version = "2", features = ["serde"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "time", "sync", "io-util"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream", "json", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots", "stream", "json", "gzip"] }
 async-trait = "0.1"
 quick-xml = "0.37"
 clap = { version = "4", features = ["derive"] }

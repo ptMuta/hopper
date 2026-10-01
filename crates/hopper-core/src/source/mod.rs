@@ -1,6 +1,7 @@
 //! Turning something the user typed into a concrete set of files to install.
 
 pub mod collection;
+pub mod curseforge;
 pub mod mrpack;
 pub mod resolve;
 /// Experimental, off by default: Modrinth publishes no API for shared instances.

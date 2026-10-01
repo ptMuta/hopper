@@ -12,14 +12,15 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 const EXAMPLES: &str = "\
 Examples:
-  hopper simply-optimized          install the latest release into .
-  hopper simply-optimized@1.11.0   install a specific version
+  hopper adrenaserver              install the latest release into .
+  hopper adrenaserver@<version>    install a specific version
+  hopper cf:deceasedcraft          install a CurseForge pack
   hopper ./pack.mrpack --eula -y   install from a file, unattended
   hopper                           update the pack installed here
   hopper -n                        check for updates without applying
 ";
 
-/// Install and update Minecraft server modpacks from Modrinth.
+/// Install and update Minecraft server modpacks from Modrinth and CurseForge.
 #[derive(Debug, Parser)]
 #[command(
     name = "hopper",
@@ -109,7 +110,7 @@ pub struct GlobalArgs {
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct InstallArgs {
-    /// Pack to install: a slug, a .mrpack file, a URL, or a collection
+    /// Pack to install: a slug, a .mrpack file, a URL, a collection, or cf:<slug>
     ///
     /// Omit it to update the pack already installed in this directory.
     #[arg(value_name = "PACK")]
@@ -141,8 +142,13 @@ pub struct InstallArgs {
     pub java: Option<PathBuf>,
 
     /// JVM to download when no suitable Java is already installed
-    #[arg(long, value_name = "NAME", default_value = "graalvm")]
-    pub java_vendor: JavaVendorArg,
+    /// [default: graalvm, or adoptium where GraalVM publishes no build]
+    ///
+    /// Left unset rather than defaulted, because naming a vendor means "only this one":
+    /// GraalVM publishes only Java 21 and 25, and the Java 17 servers that Minecraft 1.20.4
+    /// and older need would have nothing to fall back to.
+    #[arg(long, value_name = "NAME")]
+    pub java_vendor: Option<JavaVendorArg>,
 
     /// Skip files the pack marks optional
     #[arg(long)]
@@ -166,6 +172,20 @@ pub struct InstallArgs {
     /// Replace a different pack already installed in this directory
     #[arg(long)]
     pub force: bool,
+
+    /// CurseForge API key [env: CURSEFORGE_API_KEY]
+    ///
+    /// Visible to other users in `ps`; prefer the environment variable.
+    #[arg(long, value_name = "KEY")]
+    pub cf_api_key: Option<String>,
+
+    /// Build from the client pack when a CurseForge pack has no server pack, without asking
+    #[arg(long)]
+    pub allow_client_pack: bool,
+
+    /// Leave out files whose authors disabled third-party downloads, instead of stopping
+    #[arg(long)]
+    pub skip_blocked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -280,9 +300,19 @@ mod tests {
     }
 
     #[test]
-    fn the_default_java_vendor_is_graalvm() {
+    fn the_default_java_vendor_prefers_graalvm_and_can_fall_back() {
+        use hopper_core::java::{Arch, JavaVendor, Os, Platform, vendor_chain};
         let cli = Cli::parse_from(["hopper", "x"]);
-        assert_eq!(cli.install.java_vendor, JavaVendorArg::Graalvm);
+        assert_eq!(cli.install.java_vendor, None);
+
+        let linux = Platform {
+            os: Os::Linux,
+            arch: Arch::X64,
+        };
+        let preferred = cli.install.java_vendor.map(Into::into);
+        assert_eq!(vendor_chain(preferred, 21, linux)[0], JavaVendor::GraalVm);
+        // Minecraft 1.20.1 needs Java 17, which GraalVM does not publish.
+        assert_eq!(vendor_chain(preferred, 17, linux), [JavaVendor::Adoptium]);
     }
 
     #[test]

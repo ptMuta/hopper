@@ -11,7 +11,9 @@ use anyhow::{Context, Result, bail};
 use hopper_core::api::mojang::{ServerRelease, VersionManifest, WireVersionMeta};
 use hopper_core::cache::BlobStore;
 use hopper_core::java::{JavaPlan, JavaReason, JavaRequirement, Platform, plan_java};
-use hopper_core::loader::{LaunchProfile, fabric};
+use hopper_core::loader::{
+    ForgePromotions, LaunchProfile, fabric, installer, neoforge_versions_for, versions,
+};
 use hopper_core::model::{LoaderKind, Managed, MinecraftVersion, Provenance, RelPath};
 use hopper_core::net::HttpClient;
 use hopper_core::plan::DesiredFile;
@@ -55,11 +57,20 @@ pub async fn resolve_minecraft(
         .with_context(|| format!("reading metadata for Minecraft {mc}"))
 }
 
+/// What the loader needs from its surroundings beyond the network.
+pub struct LoaderEnv<'a> {
+    /// The JVM the server will run under. Forge and NeoForge installers run on it too.
+    pub java: Option<&'a std::path::Path>,
+    /// Where installer runs are staged and remembered between invocations.
+    pub cache_root: &'a std::path::Path,
+    pub quiet: bool,
+}
+
 /// Resolve the loader into installable files plus a launch profile.
 ///
-/// Only Fabric is resolvable without running anything: its meta service publishes the whole
-/// launch descriptor. The others patch the vanilla jar with an installer jar, which needs a JVM
-/// and is therefore a separate step.
+/// Fabric is resolvable without running anything: its meta service publishes the whole launch
+/// descriptor. Forge and NeoForge patch the vanilla jar with an installer, which is run once per
+/// build in the cache and never in the server directory.
 pub async fn resolve_loader(
     client: &HttpClient,
     store: &BlobStore,
@@ -67,33 +78,11 @@ pub async fn resolve_loader(
     loader_version: Option<&str>,
     mc: &MinecraftVersion,
     release: &ServerRelease,
+    env: &LoaderEnv<'_>,
 ) -> Result<Runtime> {
-    let mut files = Vec::new();
-
-    // The vanilla jar, verified against Mojang's sha1.
-    let jar_blob = client
-        .fetch_to_store(
-            std::slice::from_ref(&release.jar_url),
-            Some(&release.jar_sha1),
-            Some(release.jar_size),
-            store,
-        )
-        .await
-        .context("downloading the Minecraft server jar")?;
-    files.push(DesiredFile {
-        path: server_jar_path(),
-        content: jar_blob.digest.clone(),
-        size: Some(jar_blob.size),
-        executable: false,
-        provenance: Provenance::ServerJar {
-            minecraft: mc.clone(),
-        },
-        managed: Managed::Full,
-    });
-
     match loader {
         LoaderKind::Vanilla => Ok(Runtime {
-            files,
+            files: vec![vanilla_jar(client, store, mc, release).await?],
             launch: LaunchProfile::ExecutableJar {
                 jar: server_jar_path(),
                 jvm_args: vec![],
@@ -103,6 +92,7 @@ pub async fn resolve_loader(
             loader_version: String::new(),
         }),
         LoaderKind::Fabric => {
+            let mut files = vec![vanilla_jar(client, store, mc, release).await?];
             let version = match loader_version {
                 Some(v) if !v.is_empty() => v.to_owned(),
                 _ => {
@@ -151,11 +141,193 @@ pub async fn resolve_loader(
                 loader_version: version,
             })
         }
-        other => bail!(
-            "{other} servers need their installer jar run, which hopper does not do yet.\n\
-             help: Fabric and vanilla packs work today. Track this at the project's issues."
+        // The installer fetches its own copy of the vanilla jar into libraries/, so ours would
+        // only be a second, unused copy.
+        LoaderKind::Forge | LoaderKind::NeoForge => {
+            let version = installer_build(client, loader, loader_version, mc).await?;
+            let record = installed_build(client, store, loader, mc, &version, env).await?;
+            let files = record
+                .files
+                .into_iter()
+                .map(|f| DesiredFile {
+                    path: f.path,
+                    content: f.content,
+                    size: Some(f.size),
+                    executable: false,
+                    provenance: Provenance::Loader {
+                        loader,
+                        version: version.clone(),
+                    },
+                    managed: Managed::Full,
+                })
+                .collect();
+            Ok(Runtime {
+                files,
+                launch: record.launch,
+                java_major: release.java_major,
+                loader_version: version,
+            })
+        }
+        LoaderKind::Quilt => bail!(
+            "Quilt servers are not supported yet.\n\
+             help: Fabric, Forge, NeoForge and vanilla packs work today."
         ),
     }
+}
+
+/// The vanilla jar, verified against Mojang's sha1.
+async fn vanilla_jar(
+    client: &HttpClient,
+    store: &BlobStore,
+    mc: &MinecraftVersion,
+    release: &ServerRelease,
+) -> Result<DesiredFile> {
+    let blob = client
+        .fetch_to_store(
+            std::slice::from_ref(&release.jar_url),
+            Some(&release.jar_sha1),
+            Some(release.jar_size),
+            store,
+        )
+        .await
+        .context("downloading the Minecraft server jar")?;
+    Ok(DesiredFile {
+        path: server_jar_path(),
+        content: blob.digest,
+        size: Some(blob.size),
+        executable: false,
+        provenance: Provenance::ServerJar {
+            minecraft: mc.clone(),
+        },
+        managed: Managed::Full,
+    })
+}
+
+/// The pack's loader build, or the one upstream recommends for this Minecraft version.
+async fn installer_build(
+    client: &HttpClient,
+    loader: LoaderKind,
+    pinned: Option<&str>,
+    mc: &MinecraftVersion,
+) -> Result<String> {
+    if let Some(v) = pinned.filter(|v| !v.is_empty()) {
+        return Ok(v.to_owned());
+    }
+    if loader == LoaderKind::Forge {
+        let body = client
+            .get_bytes(versions::FORGE_PROMOTIONS)
+            .await
+            .context("fetching Forge's promoted builds")?;
+        let promos = ForgePromotions::parse(&body)?;
+        return promos
+            .build_for(mc)
+            .map(str::to_owned)
+            .ok_or_else(|| versions::VersionError::NoForgeBuild(mc.clone()).into());
+    }
+    let body = client
+        .get_bytes(versions::NEOFORGE_MAVEN_METADATA)
+        .await
+        .context("listing NeoForge builds")?;
+    let all = versions::parse_maven_metadata(&body)?;
+    let candidates = neoforge_versions_for(&all, mc);
+    installer::choose_neoforge(&candidates)
+        .map(str::to_owned)
+        .ok_or_else(|| versions::VersionError::NoNeoForgeBuild(mc.clone()).into())
+}
+
+/// The collected output of a build's installer, running it only if no earlier run is cached.
+async fn installed_build(
+    client: &HttpClient,
+    store: &BlobStore,
+    loader: LoaderKind,
+    mc: &MinecraftVersion,
+    version: &str,
+    env: &LoaderEnv<'_>,
+) -> Result<installer::InstallRecord> {
+    let staging = installer::staging_dir(env.cache_root, loader, mc, version);
+    let record_path = staging.join(installer::RECORD_FILE);
+
+    // A complete earlier run whose blobs are all still in the store needs nothing more.
+    if let Ok(bytes) = std::fs::read(&record_path)
+        && let Some(record) = installer::InstallRecord::from_json(&bytes)
+        && record.files.iter().all(|f| store.contains(&f.content))
+    {
+        return Ok(record);
+    }
+
+    let Some(java) = env.java else {
+        bail!(
+            "installing {loader} needs a JVM to run its installer, and none is available.\n\
+             help: pass --java <path> to use a specific JVM"
+        );
+    };
+
+    // Run into a fresh sibling and rename into place, so an interrupted run is never mistaken
+    // for a complete one.
+    if let Some(parent) = staging.parent() {
+        hopper_core::fs::create_dir_all(parent)?;
+    }
+    let work = staging.with_extension(format!("incoming-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    hopper_core::fs::create_dir_all(&work)?;
+
+    let url = installer::installer_url(loader, mc, version)?;
+    let sidecar = client
+        .get_bytes(&installer::sidecar_url(&url))
+        .await
+        .with_context(|| format!("fetching the checksum for the {loader} {version} installer"))?;
+    let expect = installer::parse_sha1_sidecar(&String::from_utf8_lossy(&sidecar))?;
+    let jar = client
+        .fetch_to_store(std::slice::from_ref(&url), Some(&expect), None, store)
+        .await
+        .with_context(|| format!("downloading the {loader} {version} installer"))?;
+
+    if !env.quiet {
+        println!("Running the {loader} {version} installer (this can take a minute)...");
+    }
+    let log_path = staging.with_extension("log");
+    let log = std::fs::File::create(&log_path)
+        .with_context(|| format!("creating {}", log_path.display()))?;
+    let status = tokio::process::Command::new(java)
+        .arg("-jar")
+        .arg(&jar.path)
+        .arg("--installServer")
+        .arg(&work)
+        .current_dir(&work)
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .status()
+        .await
+        .with_context(|| format!("running the {loader} installer with {}", java.display()))?;
+    if !status.success() {
+        bail!(
+            "the {loader} {version} installer failed ({status}).\n\
+             help: its output is in {}",
+            log_path.display()
+        );
+    }
+
+    let (kept, launch) = installer::collect(&work, loader)
+        .with_context(|| format!("reading what the {loader} installer produced"))?;
+    let mut files = Vec::with_capacity(kept.len());
+    for f in kept {
+        let mut reader = std::fs::File::open(&f.source)
+            .with_context(|| format!("reading {}", f.source.display()))?;
+        let blob = store.insert_reader(&mut reader, None, None)?;
+        files.push(installer::RecordedFile {
+            path: f.path,
+            content: blob.digest,
+            size: blob.size,
+        });
+    }
+    let record = installer::InstallRecord { files, launch };
+    std::fs::write(work.join(installer::RECORD_FILE), record.to_json())?;
+
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::rename(&work, &staging)
+        .with_context(|| format!("publishing the installer output to {}", staging.display()))?;
+    Ok(record)
 }
 
 /// Decide what to do about Java, without downloading anything yet.

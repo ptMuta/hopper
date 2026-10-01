@@ -26,6 +26,12 @@ pub enum SourceSpec {
         slug: String,
         version: Option<String>,
     },
+    /// A modpack on CurseForge: from a `cf:` prefix or a curseforge.com URL. The version is a
+    /// file id or a file's display name.
+    CurseForge {
+        slug: String,
+        version: Option<String>,
+    },
     /// A collection id. Carries no versions, so the caller must supply a Minecraft version and
     /// loader or infer them.
     Collection { id: String },
@@ -76,7 +82,23 @@ impl SourceSpec {
             return parse_url(arg);
         }
 
-        // 4. A bare token, with an optional `@version`.
+        // 4. An explicit CurseForge slug. Needed when the same slug exists on both registries,
+        //    since a bare token tries Modrinth first.
+        if let Some(rest) = arg
+            .strip_prefix("cf:")
+            .or_else(|| arg.strip_prefix("curseforge:"))
+        {
+            let (slug, version) = split_version(rest);
+            if slug.is_empty() {
+                return Err(SpecError::Empty);
+            }
+            return Ok(Self::CurseForge {
+                slug: slug.to_owned(),
+                version,
+            });
+        }
+
+        // 5. A bare token, with an optional `@version`.
         let (token, version) = split_version(arg);
         Ok(Self::Ambiguous {
             token: token.to_owned(),
@@ -120,9 +142,37 @@ fn parse_url(raw: &str) -> Result<SourceSpec, SpecError> {
         return parse_modrinth_url(raw, &segments);
     }
 
+    if host == "curseforge.com" || host == "www.curseforge.com" {
+        return parse_curseforge_url(raw, &segments);
+    }
+
     // Any other host, including the CDN: treat as a direct download. The allowlist still
     // applies when it is actually fetched.
     Ok(SourceSpec::Url { url })
+}
+
+fn parse_curseforge_url(raw: &str, segments: &[&str]) -> Result<SourceSpec, SpecError> {
+    match segments {
+        // `/minecraft/modpacks/<slug>`, optionally `/files/<id>` or `/download/<id>`.
+        ["minecraft", "modpacks", slug, rest @ ..] => {
+            let version = match rest {
+                ["files" | "download", id, ..] if id.bytes().all(|b| b.is_ascii_digit()) => {
+                    Some((*id).to_owned())
+                }
+                _ => None,
+            };
+            Ok(SourceSpec::CurseForge {
+                slug: (*slug).to_owned(),
+                version,
+            })
+        }
+        ["minecraft", "mc-mods", ..] => Err(SpecError::WrongProjectType(raw.to_owned(), "mod")),
+        ["minecraft", "texture-packs", ..] => {
+            Err(SpecError::WrongProjectType(raw.to_owned(), "resource pack"))
+        }
+        ["minecraft", "shaders", ..] => Err(SpecError::WrongProjectType(raw.to_owned(), "shader")),
+        _ => Err(SpecError::UnrecognisedUrl(raw.to_owned())),
+    }
 }
 
 fn parse_modrinth_url(raw: &str, segments: &[&str]) -> Result<SourceSpec, SpecError> {
@@ -161,6 +211,51 @@ mod tests {
 
     fn parse(s: &str) -> SourceSpec {
         SourceSpec::parse(s).unwrap()
+    }
+
+    #[test]
+    fn curseforge_slugs_and_urls() {
+        assert_eq!(
+            parse("cf:deceasedcraft"),
+            SourceSpec::CurseForge {
+                slug: "deceasedcraft".into(),
+                version: None
+            }
+        );
+        assert_eq!(
+            parse("curseforge:deceasedcraft@8448820"),
+            SourceSpec::CurseForge {
+                slug: "deceasedcraft".into(),
+                version: Some("8448820".into())
+            }
+        );
+        assert_eq!(
+            parse("https://www.curseforge.com/minecraft/modpacks/deceasedcraft"),
+            SourceSpec::CurseForge {
+                slug: "deceasedcraft".into(),
+                version: None
+            }
+        );
+        assert_eq!(
+            parse("https://www.curseforge.com/minecraft/modpacks/deceasedcraft/files/8448820"),
+            SourceSpec::CurseForge {
+                slug: "deceasedcraft".into(),
+                version: Some("8448820".into())
+            }
+        );
+        // The files listing page is not a version.
+        assert_eq!(
+            parse("https://www.curseforge.com/minecraft/modpacks/deceasedcraft/files"),
+            SourceSpec::CurseForge {
+                slug: "deceasedcraft".into(),
+                version: None
+            }
+        );
+        assert!(matches!(
+            SourceSpec::parse("https://www.curseforge.com/minecraft/mc-mods/jei"),
+            Err(SpecError::WrongProjectType(_, "mod"))
+        ));
+        assert!(SourceSpec::parse("cf:").is_err());
     }
 
     #[test]

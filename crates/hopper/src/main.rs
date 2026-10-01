@@ -21,6 +21,7 @@ use hopper_core::source::resolve::{Override, resolve_for_server};
 use hopper_core::source::{SourceSpec, spec::SpecError};
 
 mod cli;
+mod curseforge;
 mod render;
 mod runtime;
 
@@ -44,12 +45,55 @@ fn main() {
 /// Map a failure to an exit code, so scripts can tell "try again later" from "this is
 /// broken" and from "this was refused on security grounds".
 fn exit_code_for(e: &anyhow::Error) -> i32 {
+    use hopper_core::api::client::RegistryError;
+    use hopper_core::api::curseforge::CurseForgeError;
+    use hopper_core::net::HttpError;
+    use hopper_core::source::MrpackError;
+    use hopper_core::source::curseforge::PackError;
+
+    fn http(e: &HttpError) -> i32 {
+        match e {
+            HttpError::Host { .. } | HttpError::Blob(_) => exit::SECURITY,
+            _ if e.is_transient() => exit::NETWORK,
+            _ => exit::GENERIC,
+        }
+    }
+    fn pack(e: &MrpackError) -> i32 {
+        match e {
+            MrpackError::BadPath { .. }
+            | MrpackError::BadUrl { .. }
+            | MrpackError::SymlinkEntry(_)
+            | MrpackError::EntryTooLarge { .. }
+            | MrpackError::TotalTooLarge(_) => exit::SECURITY,
+            _ => exit::GENERIC,
+        }
+    }
+    fn curseforge(e: &CurseForgeError) -> i32 {
+        match e {
+            CurseForgeError::Http(h) => http(h),
+            // Nothing to verify a download against is refused like a failed verification.
+            CurseForgeError::NoSha1 { .. } => exit::SECURITY,
+            _ => exit::GENERIC,
+        }
+    }
+
+    // The wrapper enums are matched explicitly: `#[error(transparent)]` forwards `source()`
+    // past the wrapped error, so it never appears in the chain on its own.
     for cause in e.chain() {
-        if let Some(http) = cause.downcast_ref::<hopper_core::net::HttpError>() {
-            return match http {
-                hopper_core::net::HttpError::Host { .. } => exit::SECURITY,
-                _ if http.is_transient() => exit::NETWORK,
-                _ => exit::GENERIC,
+        if let Some(h) = cause.downcast_ref::<HttpError>() {
+            return http(h);
+        }
+        if let Some(RegistryError::Http(h)) = cause.downcast_ref::<RegistryError>() {
+            return http(h);
+        }
+        if let Some(c) = cause.downcast_ref::<CurseForgeError>() {
+            return curseforge(c);
+        }
+        if let Some(p) = cause.downcast_ref::<PackError>() {
+            return match p {
+                PackError::Archive(m) => pack(m),
+                PackError::Manifest(c) => curseforge(c),
+                PackError::MissingManifest => exit::GENERIC,
             };
         }
         if cause
@@ -59,15 +103,8 @@ fn exit_code_for(e: &anyhow::Error) -> i32 {
             // A hash mismatch is a verification failure, not a flaky network.
             return exit::SECURITY;
         }
-        if let Some(pack) = cause.downcast_ref::<hopper_core::source::MrpackError>() {
-            return match pack {
-                hopper_core::source::MrpackError::BadPath { .. }
-                | hopper_core::source::MrpackError::BadUrl { .. }
-                | hopper_core::source::MrpackError::SymlinkEntry(_)
-                | hopper_core::source::MrpackError::EntryTooLarge { .. }
-                | hopper_core::source::MrpackError::TotalTooLarge(_) => exit::SECURITY,
-                _ => exit::GENERIC,
-            };
+        if let Some(m) = cause.downcast_ref::<MrpackError>() {
+            return pack(m);
         }
     }
     exit::GENERIC
@@ -217,7 +254,7 @@ async fn install(cli: &Cli) -> Result<i32> {
             eprintln!("\nhelp: install one with");
             eprintln!("        hopper <pack>");
             eprintln!("      for example");
-            eprintln!("        hopper simply-optimized");
+            eprintln!("        hopper adrenaserver");
             return Ok(exit::GENERIC);
         }
     };
@@ -247,6 +284,29 @@ async fn install(cli: &Cli) -> Result<i32> {
     // A collection has no archive to download: it is a list of projects, and hopper picks
     // which versions of them to install. Everything downstream is identical, so it is turned
     // into a pack here rather than becoming a second code path.
+    let cf_key = curseforge::api_key(cli.install.cf_api_key.as_deref());
+    let cf_opts = curseforge::Options {
+        api_key: cf_key.as_deref(),
+        user_agent: &user_agent(),
+        mc: wanted_mc.as_ref(),
+        fallback_accepted: existing
+            .as_ref()
+            .is_some_and(|l| l.policy.client_pack_fallback),
+        allow_client_pack: cli.install.allow_client_pack,
+        skip_blocked: cli.install.skip_blocked,
+        yes: cli.global.yes,
+        dry_run: cli.global.dry_run,
+        quiet: cli.global.quiet,
+    };
+    // Recorded so an update replays the registry that actually resolved the pack: a bare
+    // token that fell through to CurseForge must not switch to Modrinth if the same slug
+    // appears there later.
+    let mut source_arg = source_arg;
+    let mut cf_source: Option<curseforge::Resolved> = None;
+
+    // A collection has no archive to download: it is a list of projects, and hopper picks
+    // which versions of them to install. Everything downstream is identical, so it is turned
+    // into a pack here rather than becoming a second code path. CurseForge packs likewise.
     let (pack, override_content) = match &spec {
         SourceSpec::Collection { id } => {
             let pack = resolve_collection(
@@ -259,8 +319,64 @@ async fn install(cli: &Cli) -> Result<i32> {
             .await?;
             (pack, Default::default())
         }
+        SourceSpec::CurseForge { slug, version } => {
+            let version = version.as_deref().or(cli.install.version.as_deref());
+            match curseforge::resolve(slug, version, &store, &cf_opts, confirm).await? {
+                curseforge::Outcome::Declined => {
+                    println!("Aborted. Nothing changed.");
+                    return Ok(exit::DECLINED);
+                }
+                curseforge::Outcome::Resolved(r) => {
+                    let r = *r;
+                    let out = (r.pack.clone(), r.overrides.clone());
+                    cf_source = Some(r);
+                    out
+                }
+            }
+        }
         _ => {
-            let archive = load_archive(&spec, &client, &source_arg, wanted_mc.as_ref()).await?;
+            let archive = match load_archive(&spec, &client, &source_arg, wanted_mc.as_ref()).await
+            {
+                Ok(a) => a,
+                // A bare slug Modrinth does not know may be a CurseForge pack.
+                Err(e) if is_not_found(&e) => {
+                    let SourceSpec::Ambiguous { token, version } = &spec else {
+                        return Err(e);
+                    };
+                    if cf_key.is_none() {
+                        eprintln!("error: {e:#}\n");
+                        eprintln!(
+                            "help: if {token:?} is a CurseForge pack, set a CurseForge API key:"
+                        );
+                        curseforge::missing_key_help();
+                        return Ok(exit::GENERIC);
+                    }
+                    if !cli.global.quiet {
+                        println!("note: {token:?} is not on Modrinth; looking on CurseForge");
+                    }
+                    let version = version.as_deref().or(cli.install.version.as_deref());
+                    match curseforge::resolve(token, version, &store, &cf_opts, confirm).await? {
+                        curseforge::Outcome::Declined => {
+                            println!("Aborted. Nothing changed.");
+                            return Ok(exit::DECLINED);
+                        }
+                        curseforge::Outcome::Resolved(r) => {
+                            let r = *r;
+                            source_arg = match version {
+                                Some(v) if source_arg.contains('@') => format!("cf:{token}@{v}"),
+                                _ => format!("cf:{token}"),
+                            };
+                            let out = (r.pack.clone(), r.overrides.clone());
+                            cf_source = Some(r);
+                            return finish_install(
+                                cli, existing, source_arg, out, cf_source, &store, &client,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            };
             let pack = mrpack::read(std::io::Cursor::new(&archive), &HostAllowlist::packs())
                 .context("reading the modpack")?;
             let overrides =
@@ -270,6 +386,40 @@ async fn install(cli: &Cli) -> Result<i32> {
         }
     };
 
+    finish_install(
+        cli,
+        existing,
+        source_arg,
+        (pack, override_content),
+        cf_source,
+        &store,
+        &client,
+    )
+    .await
+}
+
+/// Whether an error chain bottoms out in Modrinth saying the slug does not exist.
+fn is_not_found(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<hopper_core::api::client::RegistryError>(),
+            Some(hopper_core::api::client::RegistryError::NotFound { .. })
+        )
+    })
+}
+
+/// Everything after the source is resolved into a pack: classify, plan, confirm, apply.
+async fn finish_install(
+    cli: &Cli,
+    existing: Option<Lockfile>,
+    source_arg: String,
+    (pack, override_content): (Mrpack, BTreeMap<RelPath, (hopper_core::model::Digest, u64)>),
+    cf_source: Option<curseforge::Resolved>,
+    store: &BlobStore,
+    client: &HttpClient,
+) -> Result<i32> {
+    let root = &cli.global.dir;
+    let store = store.clone();
     if !cli.global.quiet {
         println!(
             "{}{}",
@@ -446,6 +596,12 @@ async fn install(cli: &Cli) -> Result<i32> {
     // 6. Apply.
     let mut template = lockfile_template(&pack, &source_arg, existing.as_ref());
     template.policy.mods_only = mods_only;
+    if let Some(r) = &cf_source {
+        template.pack.registry = Some(r.registry);
+        template.pack.project_id = Some(r.project_id.clone());
+        template.pack.file_id = Some(r.file_id.clone());
+        template.policy.client_pack_fallback = r.client_pack_fallback;
+    }
     template.policy.include_optional = !cli.install.no_optional;
     if let Some((rt, _)) = &runtime {
         template.server.loader_version = rt.loader_version.clone();
@@ -536,7 +692,9 @@ async fn load_archive(
         SourceSpec::Ambiguous { token, version } => {
             fetch_from_registry(client, token, version.as_deref(), mc).await?
         }
-        SourceSpec::Collection { .. } => unreachable!("handled before load_archive"),
+        SourceSpec::Collection { .. } | SourceSpec::CurseForge { .. } => {
+            unreachable!("handled before load_archive")
+        }
         SourceSpec::SharedInstance { .. } => {
             bail!("shared instances are experimental and not wired up yet")
         }
@@ -754,7 +912,7 @@ async fn resolve_runtime(
         release.java_major,
         &pack.index.minecraft,
         cli.install.java.as_deref(),
-        Some(cli.install.java_vendor.into()),
+        cli.install.java_vendor.map(Into::into),
     )?;
     describe_java(&java, release.java_major, cli.global.quiet);
 
@@ -772,6 +930,11 @@ async fn resolve_runtime(
         other => other,
     };
 
+    let java_path = match &java {
+        hopper_core::java::JavaPlan::UseExisting { java } => Some(java.path.clone()),
+        _ => None,
+    };
+    let cache_root = cache_dir()?;
     let rt = runtime::resolve_loader(
         &client,
         store,
@@ -779,6 +942,11 @@ async fn resolve_runtime(
         pack.index.loader_version.as_deref(),
         &pack.index.minecraft,
         &release,
+        &runtime::LoaderEnv {
+            java: java_path.as_deref(),
+            cache_root: &cache_root,
+            quiet: cli.global.quiet,
+        },
     )
     .await?;
     Ok((rt, java))
@@ -913,6 +1081,9 @@ fn lockfile_template(pack: &Mrpack, source_arg: &str, previous: Option<&Lockfile
             name: pack.index.name.clone(),
             version_label: Some(pack.index.version_id.clone()),
             source_arg: source_arg.to_owned(),
+            registry: None,
+            project_id: None,
+            file_id: None,
         },
         policy: PolicyRecord::default(),
         files: vec![],
@@ -987,6 +1158,30 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wrapped_failures_keep_their_exit_codes() {
+        use hopper_core::api::curseforge::CurseForgeError;
+        use hopper_core::net::{HostError, HttpError};
+        let refused = || HttpError::Host {
+            url: "https://evil.test/".into(),
+            source: HostError::NoHost,
+        };
+
+        let e = anyhow::Error::from(CurseForgeError::Http(refused())).context("looking up x");
+        assert_eq!(super::exit_code_for(&e), super::exit::SECURITY);
+
+        let e = anyhow::Error::from(hopper_core::api::client::RegistryError::Http(refused()));
+        assert_eq!(super::exit_code_for(&e), super::exit::SECURITY);
+
+        let e = anyhow::Error::from(hopper_core::source::curseforge::PackError::Archive(
+            hopper_core::source::MrpackError::SymlinkEntry("run.sh".into()),
+        ));
+        assert_eq!(super::exit_code_for(&e), super::exit::SECURITY);
+
+        let e = anyhow::Error::from(CurseForgeError::NoSha1 { file: 1 });
+        assert_eq!(super::exit_code_for(&e), super::exit::SECURITY);
+    }
+
     use super::*;
 
     #[test]

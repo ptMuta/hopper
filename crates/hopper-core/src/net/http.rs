@@ -81,6 +81,38 @@ impl std::fmt::Debug for HttpClient {
 impl HttpClient {
     /// Build a client that will only ever talk to hosts on `allow`.
     pub fn new(user_agent: &str, allow: HostAllowlist) -> Result<Self, HttpError> {
+        Self::build(user_agent, allow, reqwest::header::HeaderMap::new())
+    }
+
+    /// A client that sends a credential header on every request.
+    ///
+    /// The header rides on redirect hops too, and reqwest only strips the standard auth headers
+    /// when a redirect crosses hosts. So `allow` must hold only the hosts the credential is
+    /// meant for: then a redirect anywhere else is refused before the header can leave.
+    pub fn with_secret_header(
+        user_agent: &str,
+        allow: HostAllowlist,
+        name: &'static str,
+        value: &str,
+    ) -> Result<Self, HttpError> {
+        let mut value =
+            reqwest::header::HeaderValue::from_str(value).map_err(|_| HttpError::Transport {
+                url: "<client>".into(),
+                // Deliberately not echoing the value: it is a secret.
+                message: format!("the {name} value contains characters a header cannot carry"),
+            })?;
+        // Keeps it out of reqwest's Debug output.
+        value.set_sensitive(true);
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(name, value);
+        Self::build(user_agent, allow, headers)
+    }
+
+    fn build(
+        user_agent: &str,
+        allow: HostAllowlist,
+        headers: reqwest::header::HeaderMap,
+    ) -> Result<Self, HttpError> {
         let allow = Arc::new(allow);
 
         // The redirect policy is the only place a hop can be vetted before it is followed.
@@ -99,6 +131,7 @@ impl HttpClient {
 
         let inner = reqwest::Client::builder()
             .user_agent(user_agent)
+            .default_headers(headers)
             .redirect(policy)
             // Deliberately no total-request timeout. A JDK is a few hundred megabytes, and a
             // whole-request deadline turns a slow link into a hard failure no retry can fix.
@@ -384,8 +417,7 @@ impl HttpClient {
         // A cache hit skips the network entirely, which is what makes re-running after a
         // failure cheap and multi-server boxes share one copy.
         if let Some(d) = expect
-            && d.algo() == crate::model::HashAlgo::Sha512
-            && let Some(blob) = store.get(d)?
+            && let Some(blob) = store.get_verified(d)?
         {
             return Ok(blob);
         }
@@ -449,6 +481,18 @@ mod tests {
         assert!(matches!(err, HttpError::Host { .. }), "got {err:?}");
         // Never reaches the network at all.
         assert!(!err.is_transient());
+    }
+
+    #[test]
+    fn a_bad_secret_is_reported_without_echoing_it() {
+        let err = HttpClient::with_secret_header(
+            "hopper-test/0.1.0",
+            HostAllowlist::curseforge_api(),
+            "x-api-key",
+            "sec\nret-value",
+        )
+        .unwrap_err();
+        assert!(!err.to_string().contains("ret-value"), "{err}");
     }
 
     #[tokio::test]

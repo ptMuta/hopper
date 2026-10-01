@@ -321,3 +321,48 @@ fn a_hostile_pack_is_refused_with_a_security_exit_code() {
     assert_eq!(code, 5, "security refusals get their own exit code:\n{err}");
     assert!(!Path::new("/tmp/hopper-pwned").exists());
 }
+
+#[test]
+fn a_curseforge_pack_without_an_api_key_says_how_to_get_one() {
+    let s = Server::new();
+    let out = Command::new(BIN)
+        .args(["cf:deceasedcraft", "--mods-only", "--yes", "--dir"])
+        .arg(s.root())
+        .env("HOPPER_CACHE_DIR", s.cache())
+        .env_remove("CURSEFORGE_API_KEY")
+        .output()
+        .expect("running hopper");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("CURSEFORGE_API_KEY"), "{err}");
+    assert!(err.contains("console.curseforge.com"), "{err}");
+    assert!(!s.exists("mods"), "nothing is written without a key");
+}
+
+#[test]
+fn the_curseforge_key_never_appears_in_output() {
+    // A key that cannot be sent as a header fails before any request goes out, which makes
+    // the error path testable offline. Its text must still not be echoed back.
+    let s = Server::new();
+    let secret = "do-not-print-me\nsecret";
+    let out = Command::new(BIN)
+        .args([
+            "cf:deceasedcraft",
+            "--mods-only",
+            "--yes",
+            "--cf-api-key",
+            secret,
+            "--dir",
+        ])
+        .arg(s.root())
+        .env("HOPPER_CACHE_DIR", s.cache())
+        .output()
+        .expect("running hopper");
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_ne!(out.status.code(), Some(0));
+    assert!(!all.contains("do-not-print-me"), "{all}");
+}

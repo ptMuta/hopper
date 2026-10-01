@@ -224,13 +224,21 @@ pub struct ServerRecord {
     pub java_major: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackRecord {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_label: Option<String>,
     /// Exactly what the user typed, so a bare `hopper` can replay it.
     pub source_arg: String,
+    /// Where the pack came from, when a registry resolved it. Informational: updates replay
+    /// `source_arg`, these say what that resolved to last time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<RegistryId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,6 +254,10 @@ pub struct PolicyRecord {
     pub force_include: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub force_exclude: Vec<String>,
+    /// The pack published no server pack and the operator agreed to build the server from the
+    /// client pack. Remembered so an update does not ask again.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub client_pack_fallback: bool,
 }
 
 impl Lockfile {
@@ -384,6 +396,7 @@ mod tests {
                 name: "Test Pack".into(),
                 version_label: Some("1.0.0".into()),
                 source_arg: "test-pack".into(),
+                ..Default::default()
             },
             policy: PolicyRecord::default(),
             files,

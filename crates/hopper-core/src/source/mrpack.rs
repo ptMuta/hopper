@@ -406,6 +406,38 @@ pub fn stage_overrides<R: Read + Seek>(
     Ok(out)
 }
 
+/// The checks every archive entry we extract must pass, whatever the archive format.
+///
+/// Returns the entry's declared size and adds it to `total`. The declared size is only a
+/// claim; [`stage_overrides`] enforces the same limits again while actually reading.
+pub(crate) fn check_entry(
+    entry: &zip::read::ZipFile<'_>,
+    total: &mut u64,
+) -> Result<u64, MrpackError> {
+    let name = entry.name();
+    // A symlink inside the archive could point anywhere once extracted. ZIP stores the unix
+    // mode in the high bits of the external attributes; S_IFLNK is 0o120000.
+    if entry
+        .unix_mode()
+        .is_some_and(|mode| mode & 0o170000 == 0o120000)
+    {
+        return Err(MrpackError::SymlinkEntry(name.to_owned()));
+    }
+
+    let size = entry.size();
+    if size > MAX_ENTRY_BYTES {
+        return Err(MrpackError::EntryTooLarge {
+            path: name.to_owned(),
+            limit: MAX_ENTRY_BYTES,
+        });
+    }
+    *total = total.saturating_add(size);
+    if *total > MAX_TOTAL_BYTES {
+        return Err(MrpackError::TotalTooLarge(MAX_TOTAL_BYTES));
+    }
+    Ok(size)
+}
+
 /// Read and validate a `.mrpack` archive.
 pub fn read<R: Read + Seek>(reader: R, allow: &HostAllowlist) -> Result<Mrpack, MrpackError> {
     let mut zip = zip::ZipArchive::new(reader).map_err(|e| MrpackError::Archive(e.to_string()))?;
@@ -451,26 +483,7 @@ pub fn read<R: Read + Seek>(reader: R, allow: &HostAllowlist) -> Result<Mrpack, 
         if kind == OverrideKind::Client {
             continue;
         }
-        // A symlink inside the archive could point anywhere once extracted. ZIP stores the
-        // unix mode in the high bits of the external attributes; S_IFLNK is 0o120000.
-        if entry
-            .unix_mode()
-            .is_some_and(|mode| mode & 0o170000 == 0o120000)
-        {
-            return Err(MrpackError::SymlinkEntry(name));
-        }
-
-        let size = entry.size();
-        if size > MAX_ENTRY_BYTES {
-            return Err(MrpackError::EntryTooLarge {
-                path: name,
-                limit: MAX_ENTRY_BYTES,
-            });
-        }
-        total = total.saturating_add(size);
-        if total > MAX_TOTAL_BYTES {
-            return Err(MrpackError::TotalTooLarge(MAX_TOTAL_BYTES));
-        }
+        let size = check_entry(&entry, &mut total)?;
 
         let path = RelPath::parse(rest).map_err(|source| MrpackError::BadPath {
             path: name.clone(),

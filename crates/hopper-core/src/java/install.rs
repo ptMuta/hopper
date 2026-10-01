@@ -88,7 +88,12 @@ pub fn extract_tar_gz(archive: &Path, dest: &Path) -> Result<(), InstallError> {
 
         // Vendors wrap everything in one directory named after the build; strip it so the
         // layout is predictable regardless of vendor and version.
-        let Some(stripped) = raw.split_once('/').map(|(_, rest)| rest) else {
+        // Directory entries end in `/`, which a path check would otherwise read as an empty
+        // final segment and refuse. Every real JDK archive has them.
+        let Some(stripped) = raw
+            .split_once('/')
+            .map(|(_, rest)| rest.trim_end_matches('/'))
+        else {
             continue;
         };
         if stripped.is_empty() {
@@ -224,6 +229,38 @@ mod tests {
         assert!(out.join("bin/java").exists());
         assert!(out.join("lib/modules").exists());
         assert!(!out.join("jdk-21").exists());
+    }
+
+    #[test]
+    fn directory_entries_with_a_trailing_slash_are_extracted() {
+        // Real archives list directories as `jdk-17.0.20.1+1-jre/bin/`. Temurin 17 was
+        // refused as escaping the extraction directory until this was handled.
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            for dir in ["jdk-17/", "jdk-17/bin/"] {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_size(0);
+                header.set_mode(0o755);
+                header.set_cksum();
+                builder.append_data(&mut header, dir, &[][..]).unwrap();
+            }
+            let mut header = tar::Header::new_gnu();
+            header.set_size(3);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "jdk-17/bin/java", &b"jvm"[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&tar_bytes).unwrap();
+
+        let (dir, r) = extract(&gz.finish().unwrap());
+        r.unwrap();
+        assert!(dir.path().join("out/bin/java").is_file());
     }
 
     #[test]

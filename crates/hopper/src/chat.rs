@@ -20,6 +20,7 @@ use crate::cli::exit;
 
 /// How much past chat to show on opening.
 const HISTORY_SINCE: &str = "-24h";
+const HISTORY_WINDOW_S: u64 = 24 * 3600;
 
 struct Style {
     on: bool,
@@ -119,14 +120,41 @@ pub fn run(dir: &Path, name: Option<&str>) -> Result<i32> {
         ),
     ));
 
-    // The last day first, then the log is followed from now on.
-    let history: Box<dyn Iterator<Item = String>> = match &unit {
-        Some(u) => journal_history(u)?,
-        None => Box::new(file_lines(&dir.join("logs/latest.log"))),
-    };
-    for line in history {
-        if let Some(event) = chat::parse(&line) {
-            screen.show(&render(&event, time_of(&line), &style));
+    // The last day first, then the log is followed from now on. Messages sent from here go
+    // out with tellraw, which the game never logs, so they are recorded separately and merged
+    // back in by time.
+    let sent_log = SentLog::for_dir(&dir);
+    match &unit {
+        Some(u) => {
+            let mut past: Vec<(u64, String)> = journal_history(u)?
+                .into_iter()
+                .filter_map(|(received, line)| {
+                    let event = chat::parse(&line)?;
+                    // Ordered by when the server wrote the line, not when journald got it: the
+                    // console reaches the journal through a buffered pipe, so a line can arrive
+                    // well after a message sent from here, and would sort after it.
+                    let at = written_at(&line, received, utc_offset_s()).unwrap_or(received);
+                    Some((at, render(&event, time_of(&line), &style)))
+                })
+                .collect();
+            past.extend(
+                sent_log
+                    .recent()
+                    .into_iter()
+                    .map(|(at, name, msg)| (at, own_line(&name, &msg, &clock_at(at), &style))),
+            );
+            // Stable, so lines from the same second keep their order.
+            past.sort_by_key(|(at, _)| *at);
+            for (_, text) in past {
+                screen.show(&text);
+            }
+        }
+        None => {
+            for line in file_lines(&dir.join("logs/latest.log")) {
+                if let Some(event) = chat::parse(&line) {
+                    screen.show(&render(&event, time_of(&line), &style));
+                }
+            }
         }
     }
 
@@ -173,27 +201,177 @@ pub fn run(dir: &Path, name: Option<&str>) -> Result<i32> {
         };
         match echo {
             // tellraw does not reach the console log, so our own message is shown here.
-            Some(text) => screen.show(&format!(
-                "{} {text}",
-                style.paint("1;33", &format!("<{me}>"))
-            )),
+            Some(text) => {
+                sent_log.record(&me, text);
+                screen.show(&own_line(&me, text, &now_hhmm(), &style));
+            }
             // say and me come back through the log as server lines; showing them here too
             // would print them twice.
             None if echoes_through_log(&command) => screen.prompt(),
-            None => {
-                let out = strip_codes(&reply);
-                let out = out.trim_end();
-                screen.show(&style.paint("90", &format!("/{command}")));
-                if !out.is_empty() {
-                    screen.show(out);
-                }
-            }
+            None => screen.show(&command_block(&command, &strip_codes(&reply), &style)),
         }
     }
     if screen.interactive {
         println!();
     }
     Ok(exit::OK)
+}
+
+/// A command and its output: the command on a timestamped line, the output indented beneath
+/// it behind a gutter, so it reads as the command's answer rather than as chat.
+fn command_block(command: &str, output: &str, style: &Style) -> String {
+    let mut block = format!(
+        "{} {}",
+        style.paint("90", &now_hhmm()),
+        style.paint("36", &format!("/{command}"))
+    );
+    for line in output.trim_end().lines() {
+        block.push('\n');
+        block.push_str(&style.paint("90", "      │ "));
+        block.push_str(&style.paint("2", line));
+    }
+    block
+}
+
+/// A message sent from this chat, as shown: same shape as a player's, in your own colour.
+fn own_line(name: &str, message: &str, time: &str, style: &Style) -> String {
+    format!(
+        "{} {} {message}",
+        style.paint("90", time),
+        style.paint("1;33", &format!("<{name}>"))
+    )
+}
+
+/// Messages sent from `hopper chat` to one server, kept for history: the game does not log
+/// tellraw, so without this they would vanish from every later session.
+///
+/// One tab-separated line each: unix seconds, name, message. Entries older than the history
+/// window are dropped the next time the file is read.
+struct SentLog {
+    path: Option<PathBuf>,
+}
+
+impl SentLog {
+    fn for_dir(dir: &Path) -> Self {
+        let state = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")));
+        let key: String = dir
+            .to_string_lossy()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        Self {
+            path: state.map(|s| {
+                s.join("hopper/chat")
+                    .join(format!("{}.log", key.trim_matches('-')))
+            }),
+        }
+    }
+
+    fn record(&self, name: &str, message: &str) {
+        let Some(path) = &self.path else { return };
+        let now = unix_now();
+        // Tabs and line breaks would break the format; a chat message has no use for them.
+        let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
+        let line = format!("{now}\t{}\t{}\n", clean(name), clean(message));
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+
+    /// Entries from the last day, oldest first. Rewrites the file without older ones.
+    fn recent(&self) -> Vec<(u64, String, String)> {
+        let Some(path) = &self.path else {
+            return Vec::new();
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        let cutoff = unix_now().saturating_sub(HISTORY_WINDOW_S);
+        let all: Vec<(u64, String, String)> = text
+            .lines()
+            .filter_map(|l| {
+                let mut parts = l.splitn(3, '\t');
+                let at = parts.next()?.parse().ok()?;
+                Some((at, parts.next()?.to_owned(), parts.next()?.to_owned()))
+            })
+            .collect();
+        let kept: Vec<_> = all
+            .iter()
+            .filter(|(at, ..)| *at >= cutoff)
+            .cloned()
+            .collect();
+        if kept.len() != all.len() {
+            let body: String = kept
+                .iter()
+                .map(|(at, n, m)| format!("{at}\t{n}\t{m}\n"))
+                .collect();
+            let _ = hopper_core::fs::write_atomic(path, body.as_bytes(), false);
+        }
+        kept
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `HH:MM` local time of a unix timestamp.
+fn clock_at(unix_s: u64) -> String {
+    clock_of(unix_s as i64 + utc_offset_s())
+}
+
+/// The local wall-clock time as `HH:MM`, matching the server log's timestamps.
+///
+/// hopper has no time-zone database; the offset is asked of `date` once and applied to the
+/// system clock.
+fn now_hhmm() -> String {
+    clock_at(unix_now())
+}
+
+/// The local UTC offset in seconds, asked of `date` once.
+fn utc_offset_s() -> i64 {
+    static OFFSET_S: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *OFFSET_S.get_or_init(|| {
+        Command::new("date")
+            .arg("+%z")
+            .output()
+            .ok()
+            .and_then(|o| parse_utc_offset(String::from_utf8_lossy(&o.stdout).trim()))
+            .unwrap_or(0)
+    })
+}
+
+/// `+0300` -> 10800 seconds.
+fn parse_utc_offset(s: &str) -> Option<i64> {
+    let (sign, rest) = match s.as_bytes().first()? {
+        b'+' => (1, &s[1..]),
+        b'-' => (-1, &s[1..]),
+        _ => return None,
+    };
+    if rest.len() != 4 {
+        return None;
+    }
+    let h: i64 = rest[..2].parse().ok()?;
+    let m: i64 = rest[2..].parse().ok()?;
+    Some(sign * (h * 3600 + m * 60))
+}
+
+/// `HH:MM` of a time of day given in seconds since the epoch, already shifted to local time.
+fn clock_of(secs: i64) -> String {
+    let day = secs.rem_euclid(86_400);
+    format!("{:02}:{:02}", day / 3600, day / 60 % 60)
 }
 
 /// Commands whose effect the console log already shows.
@@ -229,9 +407,29 @@ fn time_of(line: &str) -> Option<&str> {
     (clock.len() >= 5 && clock.as_bytes()[2] == b':').then(|| &clock[..5])
 }
 
-/// The last day of the unit's journal, read to the end.
-fn journal_history(unit: &str) -> Result<Box<dyn Iterator<Item = String>>> {
-    let mut child = Command::new("journalctl")
+/// When the server wrote `line`, as unix seconds: the time of day from the line's own
+/// timestamp, on the day journald received it. A line stamped later in the day than it was
+/// received was written the day before (received just after midnight).
+fn written_at(line: &str, received: u64, utc_offset: i64) -> Option<u64> {
+    let stamp = line.strip_prefix('[')?.split(']').next()?;
+    let clock = stamp.rsplit(' ').next()?;
+    let mut parts = clock.split(':');
+    let h: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let sec: i64 = parts.next()?.get(..2)?.parse().ok()?;
+    let of_day = h * 3600 + m * 60 + sec;
+
+    let local = received as i64 + utc_offset;
+    let mut written = local - local.rem_euclid(86_400) + of_day;
+    if written > local + 60 {
+        written -= 86_400;
+    }
+    u64::try_from(written - utc_offset).ok()
+}
+
+/// The last day of the unit's journal, each line with its unix time in seconds.
+fn journal_history(unit: &str) -> Result<Vec<(u64, String)>> {
+    let out = Command::new("journalctl")
         .args([
             "--user",
             "--unit",
@@ -241,20 +439,38 @@ fn journal_history(unit: &str) -> Result<Box<dyn Iterator<Item = String>>> {
             "--until",
             "now",
             "--output",
-            "cat",
+            "json",
+            "--output-fields",
+            "MESSAGE",
             "--no-pager",
         ])
-        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
+        .output()
         .context("running journalctl")?;
-    let out = child.stdout.take().expect("piped");
-    let lines = BufReader::new(out).lines().map_while(Result::ok);
-    // Reaped once the history has been read.
-    Ok(Box::new(lines.chain(std::iter::from_fn(move || {
-        let _ = child.wait();
-        None
-    }))))
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(parse_journal_json)
+        .collect())
+}
+
+/// One `journalctl --output json` record: its time and message.
+///
+/// A message that is not valid UTF-8 comes as an array of bytes rather than a string.
+fn parse_journal_json(line: &str) -> Option<(u64, String)> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let at = v["__REALTIME_TIMESTAMP"].as_str()?.parse::<u64>().ok()? / 1_000_000;
+    let message = match &v["MESSAGE"] {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(bytes) => {
+            let bytes: Vec<u8> = bytes
+                .iter()
+                .filter_map(|b| b.as_u64().map(|b| b as u8))
+                .collect();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+        _ => return None,
+    };
+    Some((at, message))
 }
 
 /// Follow the unit's journal from now on. The child is stopped when the follower is dropped.
@@ -336,6 +552,96 @@ impl Drop for Follower {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lines_are_ordered_by_the_servers_own_timestamp() {
+        // Received at 00:21:30 UTC, offset +3h -> 03:21:30 local; stamped 03:21:10.
+        let received = 1_790_900_000 - (1_790_900_000 % 86_400) + 21 * 60 + 30;
+        let offset = 3 * 3600;
+        let line = "[01Oct2026 03:21:10.553] [Server thread/INFO]: [Rcon] before";
+        assert_eq!(written_at(line, received, offset), Some(received - 20));
+        let vanilla = "[03:21:10] [Server thread/INFO]: [Rcon] before";
+        assert_eq!(written_at(vanilla, received, offset), Some(received - 20));
+        // Stamped 23:59:59 local but received at 00:00:05 local: the day before.
+        let just_after_midnight = 1_790_900_000 - (1_790_900_000 % 86_400) - offset as u64 + 5;
+        let late = "[23:59:59] [Server thread/INFO]: x";
+        assert_eq!(
+            written_at(late, just_after_midnight, offset),
+            Some(just_after_midnight - 6)
+        );
+        assert_eq!(written_at("no stamp", received, offset), None);
+    }
+
+    #[test]
+    fn journal_records_give_time_and_message() {
+        let rec = r#"{"__REALTIME_TIMESTAMP":"1790891234567890","MESSAGE":"[12:00:00] [Server thread/INFO]: <Steve> hi"}"#;
+        assert_eq!(
+            parse_journal_json(rec),
+            Some((
+                1_790_891_234,
+                "[12:00:00] [Server thread/INFO]: <Steve> hi".into()
+            ))
+        );
+        let bytes = r#"{"__REALTIME_TIMESTAMP":"1000000","MESSAGE":[104,105]}"#;
+        assert_eq!(parse_journal_json(bytes), Some((1, "hi".into())));
+        assert_eq!(parse_journal_json("not json"), None);
+    }
+
+    #[test]
+    fn sent_messages_are_kept_for_a_day_and_survive_the_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = SentLog {
+            path: Some(dir.path().join("chat/x.log")),
+        };
+        log.record("muta", "hello\tthere\nfriend");
+        let old = unix_now() - HISTORY_WINDOW_S - 60;
+        std::fs::write(
+            dir.path().join("chat/x.log"),
+            format!(
+                "{old}\tmuta\tstale\n{}",
+                std::fs::read_to_string(dir.path().join("chat/x.log")).unwrap()
+            ),
+        )
+        .unwrap();
+        let recent = log.recent();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].1, "muta");
+        assert_eq!(recent[0].2, "hello there friend");
+        // The stale entry is gone from the file too.
+        assert!(
+            !std::fs::read_to_string(dir.path().join("chat/x.log"))
+                .unwrap()
+                .contains("stale")
+        );
+    }
+
+    #[test]
+    fn command_output_is_indented_under_its_command() {
+        let plain = Style { on: false };
+        let block = command_block(
+            "list",
+            "There are 0 of a max of 20 players online:\n",
+            &plain,
+        );
+        let lines: Vec<&str> = block.lines().collect();
+        assert!(lines[0].ends_with(" /list"), "{block}");
+        assert_eq!(
+            lines[1],
+            "      │ There are 0 of a max of 20 players online:"
+        );
+        // A command with no output is just its line.
+        assert_eq!(command_block("save-all", "", &plain).lines().count(), 1);
+    }
+
+    #[test]
+    fn local_times_use_the_utc_offset() {
+        assert_eq!(parse_utc_offset("+0300"), Some(10_800));
+        assert_eq!(parse_utc_offset("-0530"), Some(-19_800));
+        assert_eq!(parse_utc_offset("UTC"), None);
+        assert_eq!(clock_of(0), "00:00");
+        assert_eq!(clock_of(23 * 3600 + 59 * 60 + 59), "23:59");
+        assert_eq!(clock_of(-60), "23:59");
+    }
 
     #[test]
     fn say_and_me_are_not_echoed_twice() {

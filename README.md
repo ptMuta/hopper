@@ -66,6 +66,8 @@ Every update restates how many of your own files it left alone.
 - Writes a `start.sh` that works the same whatever the loader, and a `jvm.args` that is yours to
   edit. On Forge and NeoForge this replaces `user_jvm_args.txt`, so there is one knob to learn.
   Edit `start.sh` and hopper stops regenerating it, writing `start.sh.new` beside it instead.
+- Never installs anything under a dot-folder (`.mixin.out/`, `.connector/`, `.cache/`, …).
+  These hold tool or runtime state that packs ship by accident, never server content.
 - **Keeps client-only mods off your server.** Pack metadata is frequently missing or wrong, so
   several signals are weighed against each other, and what was skipped is reported rather than
   silently dropped.
@@ -110,7 +112,9 @@ This writes systemd **user** units, so no root is needed, and enables them:
   operator would: `stop` over RCON, then waits until the world is saved. If RCON isn't
   reachable, it falls back to SIGTERM.
 - With `--update <schedule>`, `hopper-<dir>-update.timer` checks for pack updates. Only when
-  something changed does it stop the server, apply the update and start it again; a server you
+  the pack itself changed does it stop the server, apply the update and start it again. Files
+  the server deleted or rewrote while running don't count, and are put back by the next real
+  update; a server you
   stopped yourself stays stopped. The schedule is `hourly`, `daily`, `weekly` (both at 04:00),
   `off`, or any systemd `OnCalendar` expression, and belongs to that installation: re-run
   `service install` with a new `--update` to change it. A CurseForge pack's API key is copied
@@ -192,7 +196,7 @@ that list. Security refusals exit `5`, transient network failures `4`.
 
 ```sh
 cargo build --release          # target/release/hopper, ~4MB
-cargo test                     # 533 tests, no network needed
+cargo test                     # 535 tests, no network needed
 ```
 
 ### A static binary for servers

@@ -220,6 +220,13 @@ pub struct InstallArgs {
     /// Leave out files whose authors disabled third-party downloads, instead of stopping
     #[arg(long)]
     pub skip_blocked: bool,
+
+    /// With --dry-run: report changes only when the pack itself changed
+    ///
+    /// Files the server deleted or rewrote while running are local drift, not an update. The
+    /// update timer uses this so drift alone never restarts a server.
+    #[arg(long, hide = true, requires = "dry_run")]
+    pub pack_changes_only: bool,
 }
 
 #[derive(Debug, Subcommand)]

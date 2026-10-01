@@ -506,3 +506,46 @@ fn a_second_server_gets_a_port_the_first_does_not_use() {
     assert_ne!(port(&a.root()), port(&b_root));
     assert!(port(&a.root()) >= 25565 && port(&b_root) > 25565);
 }
+
+#[test]
+fn drift_alone_is_not_a_pack_change_for_the_update_timer() {
+    // The server deleting a file it regenerates must not make a scheduled update restart it.
+    let s = Server::new();
+    let pack = s.dir.path().join("p.mrpack");
+    build_pack(&pack, "1.0.0", &[("overrides/config/a.toml", "a = 1\n")]);
+    let (out, err, code) = s.install(&pack, &["--yes"]);
+    assert_eq!(code, 0, "{out}{err}");
+    std::fs::remove_file(s.root().join("config/a.toml")).unwrap();
+
+    // An ordinary dry run still reports it: the file would be restored.
+    let (_, _, code) = s.run(&["--mods-only", "--dry-run"]);
+    assert_eq!(code, 10);
+    // The timer's check does not.
+    let (out, err, code) = s.run(&["--mods-only", "--dry-run", "--pack-changes-only"]);
+    assert_eq!(code, 0, "{out}{err}");
+
+    // A real pack change still counts.
+    build_pack(&pack, "1.1.0", &[("overrides/config/a.toml", "a = 2\n")]);
+    let (_, _, code) = s.run(&["--mods-only", "--dry-run", "--pack-changes-only"]);
+    assert_eq!(code, 10);
+}
+
+#[test]
+fn dot_folders_in_a_pack_are_never_installed() {
+    let s = Server::new();
+    let pack = s.dir.path().join("p.mrpack");
+    build_pack(
+        &pack,
+        "1.0.0",
+        &[
+            ("overrides/.mixin.out/class/X.class", "x"),
+            ("overrides/mods/.connector/temp/y.jar", "y"),
+            ("overrides/config/a.toml", "a = 1\n"),
+        ],
+    );
+    let (out, err, code) = s.install(&pack, &["--yes"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(s.exists("config/a.toml"));
+    assert!(!s.exists(".mixin.out"), "{out}");
+    assert!(!s.exists("mods/.connector"), "{out}");
+}

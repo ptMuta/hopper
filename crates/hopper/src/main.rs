@@ -686,6 +686,29 @@ async fn finish_install(
         }
     }
 
+    if cli.install.pack_changes_only {
+        // Putting back a missing file with the content it had is drift, not an update. A
+        // restore with different content means the pack changed it too; so does everything
+        // else that writes or deletes.
+        let drift = |path: &RelPath, d: &hopper_core::plan::Decision| match d {
+            hopper_core::plan::Decision::Add {
+                restore: true,
+                content,
+            } => existing
+                .as_ref()
+                .and_then(|l| l.file(path))
+                .is_some_and(|f| f.digest == *content),
+            _ => false,
+        };
+        let pack_changed = decisions
+            .iter()
+            .any(|(path, d)| d.mutates() && !drift(path, d));
+        return Ok(if pack_changed || installer_pending {
+            exit::CHANGES_PENDING
+        } else {
+            exit::OK
+        });
+    }
     if installer_pending {
         if !cli.global.quiet {
             println!(

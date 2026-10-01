@@ -237,11 +237,14 @@ pub fn remove(dir: &Path, name: Option<&str>, quiet: bool) -> Result<i32> {
     Ok(exit::OK)
 }
 
-/// What the update timer runs: check, and only if something changed, stop, update and start.
+/// What the update timer runs: check, and only if the pack changed, stop, update and start.
+///
+/// Files the server itself deleted or rewrote are not a reason to restart it; they are put
+/// back by the next real update.
 pub fn run_update(dir: &Path, unit: &str) -> Result<i32> {
     let hopper = std::env::current_exe().context("locating the hopper binary")?;
     let check = Command::new(&hopper)
-        .args(["--dry-run", "--quiet", "--dir"])
+        .args(["--dry-run", "--quiet", "--pack-changes-only", "--dir"])
         .arg(dir)
         .status()
         .context("checking for updates")?;

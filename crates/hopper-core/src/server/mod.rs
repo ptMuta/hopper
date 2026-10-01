@@ -5,6 +5,7 @@
 //! loader — which is the only way to hide the Fabric-launch-jar versus NeoForge-argfile split
 //! from the operator.
 
+pub mod chat;
 pub mod ping;
 pub mod ports;
 pub mod properties;

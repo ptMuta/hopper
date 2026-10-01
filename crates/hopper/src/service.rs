@@ -547,7 +547,7 @@ fn rcon_target(dir: &Path, unit: Option<&str>) -> Result<RconTarget> {
 
 /// Connect, waiting while the service is still starting: RCON only opens once the world has
 /// loaded, which takes minutes for a large pack.
-fn connect_waiting(dir: &Path) -> Result<Rcon> {
+pub fn connect_waiting(dir: &Path) -> Result<Rcon> {
     use hopper_core::server::rcon::RconError;
 
     let unit = unit_for(dir);

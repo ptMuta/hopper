@@ -100,6 +100,17 @@ pub enum Command {
         command: Vec<String>,
     },
 
+    /// Chat with the players on the running server, and run console commands
+    ///
+    /// Shows chat, joins and leaves as they happen. A line you type is shown to every player;
+    /// a line starting with / runs as a console command (/list, /kick Steve, /time set day)
+    /// and prints its output. /quit or Ctrl-D leaves.
+    Chat {
+        /// The name players see your messages under [default: your login name]
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+    },
+
     /// Show the server at a glance: status, MOTD, players, version and the address to share
     ///
     /// The public address comes from one DNS query to Google's nameservers, the same as

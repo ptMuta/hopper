@@ -20,6 +20,7 @@ use hopper_core::source::mrpack::{self, Mrpack};
 use hopper_core::source::resolve::{Override, resolve_for_server};
 use hopper_core::source::{SourceSpec, spec::SpecError};
 
+mod chat;
 mod cli;
 mod curseforge;
 mod instances;
@@ -185,6 +186,7 @@ async fn run(cli: &Cli) -> Result<i32> {
         },
         Some(Command::Console { command }) => service::console(root, command),
         Some(Command::Show { plain }) => show::run(root, *plain),
+        Some(Command::Chat { name }) => chat::run(root, name.as_deref()),
         Some(Command::Logs { args }) => service::logs(root, args),
         Some(Command::Completions { shell }) => {
             let mut cmd = <Cli as clap::CommandFactory>::command();

@@ -130,10 +130,17 @@ Then:
 hopper show                       # status, uptime, MOTD, players, version, address
 hopper console list               # one command over RCON (waits if the server is starting)
 hopper console                    # interactive; Ctrl-D to leave
+hopper chat                       # talk with players; /command runs a console command
 hopper logs -f                    # journalctl for this server; flags pass straight through
 systemctl --user restart hopper-<dir>
 hopper service remove             # stop and delete the units; the server is untouched
 ```
+
+`hopper chat` follows the server's log for chat, joins and leaves, starting with recent
+history. A line you type is shown to every player as `<you> message`, and a line starting
+with `/` runs as a console command, with its output printed (`/list`, `/kick Steve`,
+`/time set day`). `--name` changes the name players see. Without a hopper service, it
+follows `logs/latest.log` instead of the journal.
 
 `hopper show` prints the public, LAN and `host:port` addresses on lines of their own, ready to
 paste into the game. The public address comes from one DNS query to Google's nameservers
@@ -155,6 +162,7 @@ other than the directory's.
 | `hopper service install` / `remove` | run the server under systemd --user |
 | `hopper console [cmd]` | send a command to the running server over RCON |
 | `hopper show` | the server at a glance, with the address to share |
+| `hopper chat` | chat with players and run console commands |
 | `hopper logs [journalctl flags]` | the server's log |
 | `hopper self-update` | update hopper to the latest release |
 | `hopper completions <shell>` | print a shell completion script |
@@ -209,7 +217,7 @@ that list. Security refusals exit `5`, transient network failures `4`.
 
 ```sh
 cargo build --release          # target/release/hopper, ~4MB
-cargo test                     # 550 tests, no network needed
+cargo test                     # 557 tests, no network needed
 ```
 
 ### A static binary for servers

@@ -5,6 +5,7 @@
 //! loader — which is the only way to hide the Fabric-launch-jar versus NeoForge-argfile split
 //! from the operator.
 
+pub mod ports;
 pub mod properties;
 pub mod rcon;
 pub mod systemd;
@@ -48,14 +49,16 @@ pub fn eula_accepted(contents: &str) -> bool {
 ///
 /// Seeded once and then never touched again: the operator's port, MOTD and difficulty are
 /// theirs, and a pack update has no business rewriting them.
-pub fn default_server_properties() -> String {
-    "# Minecraft server properties\n\
-     # Seeded by hopper on first install. hopper will not modify this file again.\n\
-     server-port=25565\n\
-     motd=A Minecraft Server\n\
-     online-mode=true\n\
-     max-players=20\n"
-        .to_owned()
+pub fn default_server_properties(server_port: u16) -> String {
+    format!(
+        "# Minecraft server properties\n\
+         # Seeded by hopper on first install. hopper will not modify this file again,\n\
+         # except `hopper service install`, which sets the rcon settings.\n\
+         server-port={server_port}\n\
+         motd=A Minecraft Server\n\
+         online-mode=true\n\
+         max-players=20\n"
+    )
 }
 
 /// Suggested heap size in gigabytes, derived from total system memory.
@@ -223,7 +226,7 @@ mod tests {
 
     #[test]
     fn server_properties_are_seeded_with_sane_defaults() {
-        let p = default_server_properties();
+        let p = default_server_properties(25565);
         assert!(p.contains("server-port=25565"));
         // States plainly that it will not be touched again.
         assert!(p.contains("will not modify"));

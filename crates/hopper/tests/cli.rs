@@ -30,6 +30,12 @@ impl Server {
         self.dir.path().join("cache")
     }
 
+    /// Kept inside the test's own directory: installs record themselves in the data directory,
+    /// and the suite must never write to the real one.
+    fn data(&self) -> PathBuf {
+        self.dir.path().join("data")
+    }
+
     /// Install a pack. Always `--mods-only`, so the suite never touches the network: the
     /// loader, server jar and JVM all come from remote metadata.
     fn install(&self, pack: &Path, extra: &[&str]) -> (String, String, i32) {
@@ -44,6 +50,7 @@ impl Server {
             .arg("--dir")
             .arg(self.root())
             .env("HOPPER_CACHE_DIR", self.cache())
+            .env("HOPPER_DATA_DIR", self.data())
             .output()
             .expect("running hopper");
         (
@@ -329,6 +336,7 @@ fn a_curseforge_pack_without_an_api_key_says_how_to_get_one() {
         .args(["cf:deceasedcraft", "--mods-only", "--yes", "--dir"])
         .arg(s.root())
         .env("HOPPER_CACHE_DIR", s.cache())
+        .env("HOPPER_DATA_DIR", s.data())
         .env_remove("CURSEFORGE_API_KEY")
         .output()
         .expect("running hopper");
@@ -356,6 +364,7 @@ fn the_curseforge_key_never_appears_in_output() {
         ])
         .arg(s.root())
         .env("HOPPER_CACHE_DIR", s.cache())
+        .env("HOPPER_DATA_DIR", s.data())
         .output()
         .expect("running hopper");
     let all = format!(
@@ -463,4 +472,37 @@ fn a_version_given_twice_is_refused() {
     let (_, err, code) = s.run(&["adrenaserver@1.0", "2.0", "--mods-only", "--yes"]);
     assert_eq!(code, 1);
     assert!(err.contains("given twice"), "{err}");
+}
+
+#[test]
+fn a_second_server_gets_a_port_the_first_does_not_use() {
+    // Both installs share one data directory, the way two servers on one machine would.
+    let a = Server::new();
+    let pack = a.dir.path().join("p.mrpack");
+    build_pack(&pack, "1.0.0", &[("overrides/config/a.toml", "a\n")]);
+    let (out, err, code) = a.install(&pack, &["--yes"]);
+    assert_eq!(code, 0, "{out}{err}");
+
+    let b_root = a.dir.path().join("second");
+    let out = Command::new(BIN)
+        .args([pack.to_str().unwrap(), "--mods-only", "--yes", "--dir"])
+        .arg(&b_root)
+        .env("HOPPER_CACHE_DIR", a.cache())
+        .env("HOPPER_DATA_DIR", a.data())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+
+    let port = |dir: &Path| -> u16 {
+        std::fs::read_to_string(dir.join("server.properties"))
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("server-port="))
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    // Neither server is running, so only the record of the first keeps them apart.
+    assert_ne!(port(&a.root()), port(&b_root));
+    assert!(port(&a.root()) >= 25565 && port(&b_root) > 25565);
 }

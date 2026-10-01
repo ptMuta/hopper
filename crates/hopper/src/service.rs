@@ -111,6 +111,7 @@ pub fn install(opts: &InstallOptions<'_>) -> Result<i32> {
     }
 
     // 1. RCON, so `hopper console` can reach a server that has no terminal.
+    let _ = crate::instances::register(&dir);
     let rcon = ensure_rcon(&dir)?;
 
     // 2. Units.
@@ -331,7 +332,7 @@ fn ensure_rcon(dir: &Path) -> Result<RconSetup> {
         });
     }
 
-    let port = port.unwrap_or_else(free_port);
+    let port = port.unwrap_or_else(|| crate::instances::pick_rcon_port(dir));
     let password = match password {
         Some(p) => p.to_owned(),
         None => random_password()?,
@@ -361,13 +362,6 @@ fn restrict(path: &Path) -> Result<()> {
             .with_context(|| format!("restricting {}", path.display()))?;
     }
     Ok(())
-}
-
-/// The default RCON port, or the next free one, so several servers on one machine coexist.
-fn free_port() -> u16 {
-    (25575..25675)
-        .find(|p| std::net::TcpListener::bind(("0.0.0.0", *p)).is_ok())
-        .unwrap_or(25575)
 }
 
 fn random_password() -> Result<String> {

@@ -60,6 +60,9 @@ Every update restates how many of your own files it left alone.
   on CurseForge too).
 - Installs the **mod loader** and the vanilla server jar, and provisions a **JVM** (GraalVM by
   default, `--java-vendor adoptium` otherwise) when nothing suitable is installed.
+- Gives each server its own ports. A new install takes the first game port from 25565 up that
+  nothing is listening on and no other server hopper installed has configured, stopped or not;
+  RCON does the same from 25575.
 - Writes a `start.sh` that works the same whatever the loader, and a `jvm.args` that is yours to
   edit. On Forge and NeoForge this replaces `user_jvm_args.txt`, so there is one knob to learn.
   Edit `start.sh` and hopper stops regenerating it, writing `start.sh.new` beside it instead.
@@ -113,7 +116,7 @@ This writes systemd **user** units, so no root is needed, and enables them:
   `service install` with a new `--update` to change it. A CurseForge pack's API key is copied
   to `~/.config/hopper/env` (readable only by you) for the timer to use.
 - RCON is turned on in `server.properties` with a random 32-character password, on a free port
-  from 25575, and the file is made readable only by you. RCON listens on every interface unless
+  from 25575 up, and the file is made readable only by you. RCON listens on every interface unless
   `server-ip` is set, so keep that port closed in your firewall.
 
 Then:
@@ -189,7 +192,7 @@ that list. Security refusals exit `5`, transient network failures `4`.
 
 ```sh
 cargo build --release          # target/release/hopper, ~4MB
-cargo test                     # 530 tests, no network needed
+cargo test                     # 533 tests, no network needed
 ```
 
 ### A static binary for servers

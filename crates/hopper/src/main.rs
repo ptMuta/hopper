@@ -22,6 +22,7 @@ use hopper_core::source::{SourceSpec, spec::SpecError};
 
 mod cli;
 mod curseforge;
+mod instances;
 mod render;
 mod runtime;
 mod selfupdate;
@@ -802,14 +803,24 @@ async fn finish_install(
         write_start_script(root, start, cli.global.quiet)?;
     }
 
+    // Recorded before choosing a port, so the next install on this machine steers clear of
+    // this one's even while it is stopped.
+    let _ = instances::register(root);
     let props = root.join("server.properties");
     if !props.exists() {
+        let port = instances::pick_server_port(root);
         hfs::write_atomic(
             &props,
-            hopper_core::server::default_server_properties().as_bytes(),
+            hopper_core::server::default_server_properties(port).as_bytes(),
             false,
         )
         .context("seeding server.properties")?;
+        if port != hopper_core::server::ports::DEFAULT_SERVER_PORT && !cli.global.quiet {
+            println!(
+                "\n  Port {} is in use or belongs to another server here, so this one uses {port}.",
+                hopper_core::server::ports::DEFAULT_SERVER_PORT
+            );
+        }
     }
 
     if !cli.global.quiet {

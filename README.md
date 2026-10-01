@@ -135,8 +135,10 @@ systemctl --user restart hopper-<dir>
 hopper service remove             # stop and delete the units; the server is untouched
 ```
 
-`hopper show` prints the address as `ip:port` and `host:port` on lines of their own, ready to
-paste into the game. Piped, or with `--plain`, it prints plain `key: value` lines.
+`hopper show` prints the public, LAN and `host:port` addresses on lines of their own, ready to
+paste into the game. The public address comes from one DNS query to Google's nameservers
+(`o-o.myaddr.l.google.com`); players outside your network reach it only if the port is
+forwarded to this machine. Piped, or with `--plain`, it prints plain `key: value` lines.
 
 User services stop when you log out and don't start at boot unless lingering is on
 (`loginctl enable-linger`); `service install` tells you if it isn't. `--name` picks a unit name
@@ -207,7 +209,7 @@ that list. Security refusals exit `5`, transient network failures `4`.
 
 ```sh
 cargo build --release          # target/release/hopper, ~4MB
-cargo test                     # 543 tests, no network needed
+cargo test                     # 547 tests, no network needed
 ```
 
 ### A static binary for servers

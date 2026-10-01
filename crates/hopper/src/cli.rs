@@ -101,6 +101,9 @@ pub enum Command {
     },
 
     /// Show the server at a glance: status, MOTD, players, version and the address to share
+    ///
+    /// The public address comes from one DNS query to Google's nameservers, the same as
+    /// `dig TXT o-o.myaddr.l.google.com @ns1.google.com`.
     Show {
         /// Plain `key: value` lines, no art or colour (the default when piped)
         #[arg(long)]

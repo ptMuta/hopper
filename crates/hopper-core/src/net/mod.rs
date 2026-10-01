@@ -2,6 +2,7 @@
 
 pub mod allowlist;
 pub mod http;
+pub mod publicip;
 
 pub use allowlist::{HostAllowlist, HostError, PACK_HOSTS, RUNTIME_HOSTS};
 pub use http::{HttpClient, HttpError};

@@ -42,6 +42,11 @@ pub fn run(dir: &Path, plain: bool) -> Result<i32> {
         .unwrap_or(25565);
     let bind = properties::get(&props, "server-ip").filter(|h| !h.is_empty());
 
+    // Started first and joined late: the lookup overlaps the status ping instead of adding to it.
+    let public_lookup = std::thread::spawn(|| {
+        hopper_core::net::publicip::lookup(std::time::Duration::from_secs(2))
+    });
+
     let unit = crate::service::unit_for(&dir);
     let state = unit
         .as_deref()
@@ -100,7 +105,16 @@ pub fn run(dir: &Path, plain: bool) -> Result<i32> {
         format!("Minecraft {} · {loader}", lock.server.minecraft),
     );
 
-    // Addresses, each on its own line with nothing after it, so a triple-click copies it.
+    // Addresses, each on its own line with nothing after it, so a triple-click copies it. The
+    // public one is what players outside the network use, if the port is forwarded to here.
+    if let Ok(ips) = public_lookup.join() {
+        if let Some(ip) = ips.v4 {
+            add("Public", format!("{ip}:{port}"));
+        }
+        if let Some(ip) = ips.v6 {
+            add("Public", format!("[{ip}]:{port}"));
+        }
+    }
     match bind {
         Some(ip) => add("Address", format!("{ip}:{port}")),
         None => {

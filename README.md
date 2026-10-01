@@ -1,15 +1,40 @@
 # hopper
 
-Install and update Minecraft **server** modpacks from Modrinth and CurseForge. One static-ish
-binary, no runtime dependencies beyond libc.
+Install and update Minecraft **server** modpacks from Modrinth and CurseForge. One static
+binary with no runtime dependencies: it fetches the JVM and mod loader a pack needs itself.
 
 ```sh
-hopper adrenaserver         # install into the current directory
+hopper adrenaserver          # install into the current directory
 hopper cf:deceasedcraft      # a CurseForge pack (needs an API key, see below)
 hopper                       # update whatever is installed here
 hopper -n                    # check for updates, change nothing
 hopper status                # what's installed
 ```
+
+## Install
+
+On x86-64 Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ptMuta/hopper/main/install.sh | sh
+```
+
+This puts `hopper` in `~/.local/bin` after verifying it against the release's `SHA256SUMS`. It
+adds that directory to `PATH` if it isn't already on it, and sets up tab completion for bash,
+zsh and fish. Running it again is safe: it rewrites its own marked block in your shell startup
+files rather than adding another. `--version v0.1.2` pins a release; `--no-modify-path` leaves
+startup files alone; `--help` lists the rest.
+
+Update later with:
+
+```sh
+hopper self-update            # or --check to only ask whether there is a newer release
+```
+
+Prefer to do it by hand? Download the tarball from the
+[releases page](https://github.com/ptMuta/hopper/releases), check it with `sha256sum -c
+SHA256SUMS`, and put `hopper` anywhere on `PATH`. `hopper completions <bash|zsh|fish>` prints a
+completion script.
 
 ## Why another one
 
@@ -78,6 +103,8 @@ server needs, with links, and stops. Download them into `mods/` yourself and re-
 | `hopper status` | what's installed here |
 | `hopper disable <mod>` / `enable <mod>` | turn a mod off without removing it |
 | `hopper repair` | finish an interrupted update (rarely needed) |
+| `hopper self-update` | update hopper to the latest release |
+| `hopper completions <shell>` | print a shell completion script |
 
 Useful flags: `-d/--dir`, `-y/--yes`, `-n/--dry-run`, `--eula`, `--mc`, `--loader`,
 `--mods-only`, `--no-optional`, `--force-include`/`--force-exclude`, `--java`, `--java-vendor`,
@@ -124,7 +151,7 @@ that list. Security refusals exit `5`, transient network failures `4`.
 
 ```sh
 cargo build --release          # target/release/hopper, ~4MB
-cargo test                     # 513 tests, no network needed
+cargo test                     # 516 tests, no network needed
 ```
 
 ### A static binary for servers

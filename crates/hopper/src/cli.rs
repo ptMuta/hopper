@@ -73,6 +73,27 @@ pub enum Command {
     ///
     /// Normally unnecessary: recovery runs automatically at the start of every command.
     Repair,
+
+    /// Update hopper itself to the latest GitHub release
+    ///
+    /// Downloads the release for this platform, verifies it against the release's SHA256SUMS
+    /// and replaces this binary in place. Honours --yes and --dry-run.
+    SelfUpdate {
+        /// Only report whether a newer release exists [exit 10 if so]
+        #[arg(long)]
+        check: bool,
+        /// Reinstall even if this is already the latest release
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Print a shell completion script
+    ///
+    /// For example: hopper completions bash > ~/.local/share/bash-completion/completions/hopper
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Debug, Clone, clap::Args)]

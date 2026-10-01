@@ -24,6 +24,7 @@ mod cli;
 mod curseforge;
 mod render;
 mod runtime;
+mod selfupdate;
 
 use cli::{Cli, Command, exit};
 
@@ -119,6 +120,25 @@ async fn run(cli: &Cli) -> Result<i32> {
         Some(Command::Disable { name }) => toggle(root, name, true),
         Some(Command::Enable { name }) => toggle(root, name, false),
         Some(Command::Repair) => repair(root),
+        Some(Command::SelfUpdate { check, force }) => {
+            selfupdate::run(&selfupdate::Options {
+                check: *check || cli.global.dry_run,
+                force: *force,
+                yes: cli.global.yes,
+                quiet: cli.global.quiet,
+                user_agent: &user_agent(),
+                cache: &cache_dir()?,
+            })
+            .await
+        }
+        Some(Command::Completions { shell }) => {
+            let mut cmd = <Cli as clap::CommandFactory>::command();
+            let mut script = Vec::new();
+            clap_complete::generate(*shell, &mut cmd, "hopper", &mut script);
+            // A reader that stops early (`| head`) is not an error worth a panic.
+            let _ = std::io::stdout().write_all(&script);
+            Ok(exit::OK)
+        }
         None => install(cli).await,
     }
 }

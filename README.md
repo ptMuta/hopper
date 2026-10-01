@@ -136,8 +136,8 @@ systemctl --user restart hopper-<dir>
 hopper service remove             # stop and delete the units; the server is untouched
 ```
 
-`hopper chat` follows the server's log for chat, joins and leaves, starting with recent
-history. A line you type is shown to every player as `<you> message`, and a line starting
+`hopper chat` follows the server's log for chat, joins and leaves, starting with the last 24
+hours. Type at the `>` prompt: a line you type is shown to every player as `<you> message`, and a line starting
 with `/` runs as a console command, with its output printed (`/list`, `/kick Steve`,
 `/time set day`). `--name` changes the name players see. Without a hopper service, it
 follows `logs/latest.log` instead of the journal.
@@ -217,7 +217,7 @@ that list. Security refusals exit `5`, transient network failures `4`.
 
 ```sh
 cargo build --release          # target/release/hopper, ~4MB
-cargo test                     # 557 tests, no network needed
+cargo test                     # 558 tests, no network needed
 ```
 
 ### A static binary for servers

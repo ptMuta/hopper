@@ -203,9 +203,6 @@ impl Line {
         self.0.push((text.into(), tone));
         self
     }
-    pub fn text(&self) -> String {
-        self.0.iter().map(|(t, _)| t.as_str()).collect()
-    }
     fn render(&self, width: usize, paint: Paint) -> String {
         let mut budget = width.saturating_sub(1);
         let mut out = String::new();
@@ -367,6 +364,25 @@ fn drive<W: Widget>(widget: &mut W) -> Result<W::Out> {
     }
 }
 
+/// A placeholder row while something loads before a question can be asked.
+pub fn busy(key: &str) {
+    if mode() != Mode::Term {
+        return;
+    }
+    let mut err = std::io::stderr().lock();
+    let _ = write!(err, "{}", paint().dim(&row(key, "...")));
+    let _ = err.flush();
+}
+
+pub fn unbusy() {
+    if mode() != Mode::Term {
+        return;
+    }
+    let mut err = std::io::stderr().lock();
+    let _ = write!(err, "\r\x1b[2K");
+    let _ = err.flush();
+}
+
 /// Undo the row left by the previous answer, when going back to its question.
 pub fn rewind(rows: usize) {
     if mode() != Mode::Term || rows == 0 {
@@ -526,7 +542,12 @@ impl List {
             if let Some(checked) = mark(i) {
                 line = line.push(if checked { "[x] " } else { "[ ] " }, Tone::Plain);
             }
-            let label = format!("{:<label_width$}", item.label);
+            let label = if item.label.chars().count() > label_width {
+                let cut: String = item.label.chars().take(label_width.saturating_sub(3)).collect();
+                format!("{cut}...")
+            } else {
+                format!("{:<label_width$}", item.label)
+            };
             line = match (&item.disabled, here) {
                 (Some(_), _) => line.push(label, Tone::Dim),
                 (None, true) => line.push(label, Tone::Bold),
@@ -845,7 +866,9 @@ pub fn text(key: &str, default: Option<&str>, validate: Validate) -> Result<Stri
 
 struct YesNo<'a> {
     key: &'a str,
+    detail: &'a str,
     default: bool,
+    words: [&'a str; 2],
 }
 
 impl Widget for YesNo<'_> {
@@ -855,7 +878,12 @@ impl Widget for YesNo<'_> {
     }
     fn render(&self, _: usize) -> Vec<Line> {
         let choices = if self.default { "Y/n" } else { "y/N" };
-        vec![header(self.key, &[(choices.into(), Tone::Dim)], "")]
+        let mut input = vec![];
+        if !self.detail.is_empty() {
+            input.push((format!("{}  ", self.detail), Tone::Plain));
+        }
+        input.push((choices.into(), Tone::Dim));
+        vec![header(self.key, &input, "")]
     }
     fn handle(&mut self, key: Key) -> Step<bool> {
         match key {
@@ -867,14 +895,20 @@ impl Widget for YesNo<'_> {
         }
     }
     fn summary(&self, &yes: &bool) -> Line {
-        answered(self.key, if yes { "yes" } else { "no" }, Tone::Plain)
+        answered(self.key, self.words[usize::from(!yes)], Tone::Plain)
     }
 }
 
-fn yes_no(key: &str, default: bool) -> Result<bool> {
+fn yes_no(key: &str, detail: &str, default: bool, words: [&str; 2]) -> Result<bool> {
     match mode() {
-        Mode::Line => line::confirm(key, default),
-        _ => drive(&mut YesNo { key, default }),
+        Mode::Line if detail.is_empty() => line::confirm(key, default),
+        Mode::Line => line::confirm(&format!("{key}: {detail}"), default),
+        _ => drive(&mut YesNo {
+            key,
+            detail,
+            default,
+            words,
+        }),
     }
 }
 
@@ -885,16 +919,21 @@ pub fn ask(key: &str, default: bool) -> Result<bool> {
         note(key, if default { "yes" } else { "no" });
         return Ok(default);
     }
-    yes_no(key, default)
+    yes_no(key, "", default, ["yes", "no"])
 }
 
 /// Agreement only a person can give (EULA, client pack, firewall): never assumed, never
 /// taken from `-y`, default no. False when nobody can be asked.
 pub fn consent(question: &str) -> Result<bool> {
+    agree(question, "")
+}
+
+/// [`consent`] in the grid: `? EULA        accept https://...  y/N`.
+pub fn agree(key: &str, detail: &str) -> Result<bool> {
     if !enabled() {
         return Ok(false);
     }
-    yes_no(question, false)
+    yes_no(key, detail, false, ["accepted", "declined"])
 }
 
 /// A pause before something disruptive. Scripts proceed exactly as before this prompt
@@ -903,7 +942,7 @@ pub fn proceed(question: &str, default: bool) -> Result<bool> {
     if !enabled() || assume_defaults() {
         return Ok(true);
     }
-    yes_no(question, default)
+    yes_no(question, "", default, ["yes", "no"])
 }
 
 #[cfg(test)]

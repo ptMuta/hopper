@@ -667,8 +667,13 @@ mod tests {
         let Some(crate::interface::Action::Install(create)) = app.command else {
             panic!()
         };
-        let mut record =
-            Instance::new(Scope::User, "sparse-world", create.source, create.runtime).unwrap();
+        let mut record = Instance::new(
+            Scope::User,
+            "sparse-world",
+            create.source.source(create.source.provider.unwrap()),
+            create.runtime,
+        )
+        .unwrap();
         record.root = temp.path().join("managed");
         record.backup = Some(archive_path);
         fs::create_dir_all(record.server().join(".hopper")).unwrap();
@@ -804,8 +809,13 @@ mod tests {
         let Some(crate::interface::Action::Install(create)) = app.command else {
             panic!()
         };
-        let mut record =
-            Instance::new(Scope::User, "world", create.source, create.runtime).unwrap();
+        let mut record = Instance::new(
+            Scope::User,
+            "world",
+            create.source.source(create.source.provider.unwrap()),
+            create.runtime,
+        )
+        .unwrap();
         record.root = temp.path().join("managed");
         let source = temp.path().join("original");
         fs::create_dir_all(source.join("World")).unwrap();

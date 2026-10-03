@@ -22,6 +22,7 @@ use hopper_core::source::{SourceSpec, spec::SpecError};
 mod chat;
 mod cli;
 mod curseforge;
+mod discover;
 #[cfg(test)]
 mod engine_tests;
 mod gtnh;

@@ -58,10 +58,26 @@ pub enum Provider {
     Mrpack,
 }
 
-#[derive(Debug, Clone, Args, Serialize, Deserialize)]
+/// A recorded pack source. Always complete: the provider is known.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Source {
-    #[arg(long, value_enum)]
     pub provider: Provider,
+    pub pack: Option<String>,
+    pub collection: Option<String>,
+    pub file: Option<PathBuf>,
+    pub url: Option<String>,
+    pub channel: Option<String>,
+    pub pack_version: Option<String>,
+    pub mc: Option<String>,
+    pub loader: Option<crate::cli::Loader>,
+}
+
+/// A source as typed: anything may be missing until a person or an error fills the gaps.
+#[derive(Debug, Clone, Default, Args)]
+pub struct SourceArgs {
+    /// modrinth, curseforge, gtnh or mrpack; asked at a terminal when omitted.
+    #[arg(long, value_enum)]
+    pub provider: Option<Provider>,
     /// Registry slug or canonical project ID (never inferred from a URL).
     #[arg(long, conflicts_with_all = ["collection", "file", "url"])]
     pub pack: Option<String>,
@@ -83,7 +99,53 @@ pub struct Source {
     pub loader: Option<crate::cli::Loader>,
 }
 
+impl SourceArgs {
+    /// The flags each provider cannot do without, of those not given.
+    pub fn missing(&self) -> Vec<&'static str> {
+        match self.provider {
+            None => vec!["--provider"],
+            Some(Provider::Modrinth) if self.pack.is_none() && self.collection.is_none() => {
+                vec!["--pack"]
+            }
+            Some(Provider::Curseforge) if self.pack.is_none() => vec!["--pack"],
+            Some(Provider::Mrpack) if self.file.is_none() && self.url.is_none() => {
+                vec!["--file or --url"]
+            }
+            Some(_) => vec![],
+        }
+    }
+
+    /// Whether the pack itself is settled (only the release may still be open).
+    pub fn identified(&self) -> bool {
+        self.missing().is_empty()
+    }
+
+    pub fn source(&self, provider: Provider) -> Source {
+        Source {
+            provider,
+            pack: self.pack.clone(),
+            collection: self.collection.clone(),
+            file: self.file.clone(),
+            url: self.url.clone(),
+            // "stable" is the default: recording it would make an identical source differ.
+            channel: self.channel.clone().filter(|c| c != "stable"),
+            pack_version: self.pack_version.clone(),
+            mc: self.mc.clone(),
+            loader: self.loader,
+        }
+    }
+}
+
 impl Source {
+    /// The same source with defaults spelled the one way, for comparing records.
+    pub fn normalized(&self) -> Source {
+        let mut s = self.clone();
+        if s.channel.as_deref() == Some("stable") {
+            s.channel = None;
+        }
+        s
+    }
+
     pub fn validate(&self) -> Result<()> {
         let channel = self.channel.as_deref().unwrap_or("stable");
         ensure!(
@@ -187,9 +249,10 @@ pub struct RuntimeOptions {
 
 #[derive(Debug, Args)]
 pub struct Create {
-    pub name: String,
+    /// Instance name; asked at a terminal when omitted.
+    pub name: Option<String>,
     #[command(flatten)]
-    pub source: Source,
+    pub source: SourceArgs,
     #[command(flatten)]
     pub runtime: RuntimeOptions,
     /// Explicitly accept the Minecraft EULA; --yes never implies this.
@@ -210,8 +273,9 @@ pub enum Action {
     Onboard {
         #[command(flatten)]
         create: Create,
+        /// The existing server directory; asked at a terminal when omitted.
         #[arg(long)]
-        from: PathBuf,
+        from: Option<PathBuf>,
         #[arg(long)]
         installed_version: Option<String>,
         #[arg(long)]
@@ -295,8 +359,8 @@ pub enum Action {
     Providers,
     Search {
         #[arg(long, value_enum)]
-        provider: Provider,
-        query: String,
+        provider: Option<Provider>,
+        query: Option<String>,
         #[arg(long, default_value_t = 20)]
         limit: u32,
         #[arg(long, default_value_t = 0)]
@@ -304,7 +368,7 @@ pub enum Action {
     },
     Versions {
         #[command(flatten)]
-        source: Source,
+        source: SourceArgs,
     },
     SelfUpdate {
         #[arg(long)]
@@ -385,22 +449,60 @@ pub async fn run(app: &App) -> Result<i32> {
             query,
             limit,
             offset,
-        } => discovery(*provider, Some(query), None, *limit, *offset, app.json).await,
+        } => match crate::resolve::search(*provider, query.as_deref()).await? {
+            // Picked at a terminal: the command that installs it, ready to run or edit.
+            Some(line) => {
+                println!("{line}");
+                Ok(0)
+            }
+            None => {
+                let provider = provider.expect("resolved");
+                discovery(provider, query.as_deref(), None, *limit, *offset, app.json).await
+            }
+        },
         Action::Versions { source } => {
+            let source = crate::resolve::versions_source(source).await?;
             source.validate()?;
-            discovery(source.provider, None, Some(source), 50, 0, app.json).await
+            discovery(source.provider, None, Some(&source), 50, 0, app.json).await
         }
-        Action::Install(create) => create_instance(app, create, None).await,
+        Action::Install(create) => {
+            let plan = crate::resolve::install(app, create, None).await?;
+            if plan.asked && !app.quiet {
+                crate::resolve::echo(&crate::resolve::command_line(
+                    app,
+                    "install",
+                    &plan,
+                    create,
+                    &[],
+                ));
+            }
+            create_instance(app, create, &plan, None).await
+        }
         Action::Onboard {
             create,
             from,
             installed_version,
             backup,
         } => {
+            let plan = crate::resolve::install(app, create, Some(from.as_deref())).await?;
+            let from = plan.from.clone().context("no server directory chosen")?;
+            if plan.asked && !app.quiet {
+                let mut extra = vec![];
+                if let Some(v) = installed_version {
+                    extra.extend(["--installed-version".to_owned(), v.clone()]);
+                }
+                if let Some(b) = backup {
+                    extra.extend(["--backup".to_owned(), b.display().to_string()]);
+                }
+                crate::resolve::echo(&crate::resolve::command_line(
+                    app, "onboard", &plan, create, &extra,
+                ));
+            }
             create_instance(
                 app,
                 create,
-                Some((from, installed_version.as_deref(), backup.as_deref())),
+                &plan,
+                Some((&from, installed_version.as_deref(), backup.as_deref())),
             )
             .await
         }
@@ -890,17 +992,18 @@ async fn discovery(
 async fn create_instance(
     app: &App,
     create: &Create,
+    plan: &crate::resolve::Plan,
     onboarding: Option<(&PathBuf, Option<&str>, Option<&std::path::Path>)>,
 ) -> Result<i32> {
-    create.source.validate()?;
+    plan.source.validate()?;
     ensure!(
-        create.runtime.java_major.is_none() || create.source.provider == Provider::Gtnh,
+        create.runtime.java_major.is_none() || plan.source.provider == Provider::Gtnh,
         "--java-major selects a GTNH distribution; other providers use their declared Java requirement or --java PATH"
     );
-    managed::validate_name(&create.name)?;
+    managed::validate_name(&plan.name)?;
     managed::preflight(app.scope)?;
-    if managed::record_path(app.scope, &create.name)?.exists() {
-        let mut existing = managed::load(app.scope, &create.name)?;
+    if managed::record_path(app.scope, &plan.name)?.exists() {
+        let mut existing = managed::load(app.scope, &plan.name)?;
         ensure!(
             existing.state == managed::State::Detached,
             "instance already exists; use configure/update or repair"
@@ -911,7 +1014,7 @@ async fn create_instance(
             "reattachment must use the existing managed server directory"
         );
         ensure!(
-            serde_json::to_value(&existing.source)? == serde_json::to_value(&create.source)?,
+            existing.source.normalized() == plan.source.normalized(),
             "reattachment cannot change pack identity/target; reattach with the recorded source, then configure it"
         );
         if app.dry_run {
@@ -927,7 +1030,7 @@ async fn create_instance(
         existing.state = managed::State::Ready;
         managed::save(&existing)?;
         drop(_guard);
-        if create.start {
+        if plan.start {
             managed::start(&mut existing, create.rcon_firewall_confirmed)?;
         }
         println!("Reattached {}; retained data unchanged.", existing.name);
@@ -940,12 +1043,12 @@ async fn create_instance(
     };
     let mut record = Instance::new(
         app.scope,
-        &create.name,
-        create.source.clone(),
+        &plan.name,
+        plan.source.clone(),
         create.runtime.clone(),
     )?;
     ensure!(
-        !managed::record_path(app.scope, &create.name)?.exists(),
+        !managed::record_path(app.scope, &plan.name)?.exists(),
         "instance already exists; use configure/update or repair"
     );
     if app.dry_run {
@@ -957,11 +1060,18 @@ async fn create_instance(
         );
         return Ok(10);
     }
+    if let Some((from, _, _)) = onboarding {
+        let question = format!(
+            "Back up {} and move it into managed storage?",
+            from.display()
+        );
+        if !crate::prompt::proceed(&question, false)? {
+            return Ok(crate::cli::exit::DECLINED);
+        }
+    }
     let _guard = managed::operation_lock(&record)?;
     let existing_eula = onboarding.is_some_and(|(from, _, _)| crate::eula_accepted(from));
-    let accepted = existing_eula
-        || create.eula
-        || crate::prompt::consent("Accept the Minecraft EULA? https://aka.ms/MinecraftEULA")?;
+    let accepted = existing_eula || plan.eula;
     if !accepted {
         return Err(crate::prompt::Declined(
             "EULA acceptance is required: pass --eula (--yes never accepts it)".into(),
@@ -1037,6 +1147,10 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
     if app.dry_run && !matches!(action, Status { .. } | Check { .. } | Logs { .. }) {
         println!("Would operate on {} ({:?})", name, app.scope);
         return Ok(10);
+    }
+    if matches!(action, Chat { .. } | Console { .. }) && crate::prompt::enabled() {
+        // Keys typed ahead at the picker belong to it, not to the session that follows.
+        crate::prompt::sys::flush_input();
     }
     // A pause before interrupting players; scripts and -y go ahead as they always have.
     let asking = crate::prompt::enabled() && !crate::prompt::assume_defaults();

@@ -1165,7 +1165,13 @@ mod tests {
         let Some(crate::interface::Action::Install(create)) = source.command else {
             panic!()
         };
-        Instance::new(scope, "world", create.source, create.runtime).unwrap()
+        Instance::new(
+            scope,
+            "world",
+            create.source.source(create.source.provider.unwrap()),
+            create.runtime,
+        )
+        .unwrap()
     }
     use clap::Parser;
     #[test]

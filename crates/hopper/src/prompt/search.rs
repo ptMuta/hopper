@@ -19,6 +19,8 @@ pub type Fetch<'a, T> =
 
 pub struct Search<'a, T> {
     pub key: &'a str,
+    /// Text already typed, e.g. a query given on the command line.
+    pub initial: String,
     /// Always offered, filtered locally (e.g. a single-pack provider).
     pub pinned: Vec<Item<T>>,
     /// Remote lookup; the empty query asks for something worth showing before typing.
@@ -126,6 +128,7 @@ pub async fn search<T: Clone>(search: Search<'_, T>) -> Result<T> {
         error: None,
         key: search.key,
     };
+    state.list.filter = search.initial.clone();
     state.rebuild(&search, None);
 
     let mut pending: Option<(String, Instant, Pending<T>)> = None;
@@ -261,7 +264,7 @@ fn short(e: &anyhow::Error) -> String {
 
 /// Line mode: a query, numbered results, then a number or a new query.
 async fn line<T: Clone>(search: &Search<'_, T>) -> Result<T> {
-    let mut query = String::new();
+    let mut query = search.initial.clone();
     loop {
         let mut items: Vec<Item<T>> = search
             .pinned
@@ -309,6 +312,7 @@ mod tests {
     fn rows_combine_pinned_remote_and_literal() {
         let search = Search {
             key: "Pack",
+            initial: String::new(),
             pinned: vec![Item::new("GT New Horizons", 0).hint("gtnh")],
             fetch: Box::new(|_| Box::pin(async { Ok(vec![]) })),
             literal: Box::new(|q: &str| {

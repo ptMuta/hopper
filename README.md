@@ -19,6 +19,44 @@ starting it. The first `start` enables the service and its configured timers.
 Use `--start` to start immediately. EULA acceptance requires `--eula` or an
 interactive confirmation; `--yes` does not accept the EULA.
 
+## At a terminal and in scripts
+
+At a terminal, anything left out is asked: `hopper install` searches Modrinth and
+CurseForge as you type, `hopper stop` lists the running instances, `hopper disable NAME`
+lists the enabled mods. Each answer collapses to one line, and the full command is printed
+before anything runs, so it can be reused in a script:
+
+```text
+$ hopper install
+  Pack        Adrenaserver
+  Name        adrenaserver
+  EULA        accepted
+  Start       no
+
+  $ hopper install adrenaserver --provider modrinth --pack adrenaserver --eula
+```
+
+Arrow keys move, typing filters, Enter picks, Esc clears the filter or goes back a
+question, Ctrl-C cancels without changing anything (exit 130).
+
+In scripts every argument stays mandatory. Nothing is asked unless stdin, stdout and
+stderr are all terminals and the command runs in the foreground; a missing argument then
+fails at once, naming all of them, with exit 2.
+
+| | At a terminal | In a script |
+| --- | --- | --- |
+| missing argument | asked | exit 2, listing every missing flag |
+| `stop`/`restart` a running server, `remove`, `update` while running, `onboard` | asked, default no (update: yes) | proceeds, as before |
+| EULA, client-pack builds, RCON firewall | asked, default no | needs `--eula`, `--allow-client-pack`, `--rcon-firewall-confirmed` |
+| `-y`, `--yes` | takes every default; still asks what has none | proceeds; consent still needs its flag |
+| `--no-input`, `HOPPER_NO_INPUT=1`, `CI`, `--json` | never asks | never asks |
+
+`-q` only quiets output. `--dry-run` asks for missing arguments, never for consent, and
+prints the command it would run. `TERM=dumb` or `HOPPER_ACCESSIBLE=1` asks numbered
+questions line by line instead of drawing menus, for screen readers and minimal
+terminals. `NO_COLOR` turns colour off. Under `sudo`, packs are typed rather than
+searched, since nothing reaches the network as root.
+
 ## Install the binary
 
 Download and verify a binary from the [releases](https://github.com/ptMuta/hopper/releases),
@@ -61,7 +99,8 @@ Changing provider/pack identity is not an update operation.
 CurseForge requires `CURSEFORGE_API_KEY`. The key is sent only to its API, never CDN
 downloads. Scheduled updates save it privately; system workers receive a systemd
 credential, not a public unit environment variable. Packs without a server pack require
-explicit `--allow-client-pack`; blocked downloads can be skipped with `--skip-blocked`.
+explicit `--allow-client-pack`, or a yes at the terminal, which is kept for later updates;
+blocked downloads can be skipped with `--skip-blocked`.
 
 ## GregTech: New Horizons
 

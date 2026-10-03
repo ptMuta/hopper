@@ -543,7 +543,11 @@ impl List {
                 line = line.push(if checked { "[x] " } else { "[ ] " }, Tone::Plain);
             }
             let label = if item.label.chars().count() > label_width {
-                let cut: String = item.label.chars().take(label_width.saturating_sub(3)).collect();
+                let cut: String = item
+                    .label
+                    .chars()
+                    .take(label_width.saturating_sub(3))
+                    .collect();
                 format!("{cut}...")
             } else {
                 format!("{:<label_width$}", item.label)

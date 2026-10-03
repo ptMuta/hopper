@@ -378,7 +378,7 @@ pub enum Action {
     },
     Completions {
         #[arg(value_enum)]
-        shell: clap_complete::Shell,
+        shell: Option<clap_complete::Shell>,
     },
     #[command(name = "__worker", hide = true)]
     Worker {
@@ -431,7 +431,7 @@ pub async fn run(app: &App) -> Result<i32> {
     match action {
         Action::Completions { shell } => {
             clap_complete::generate(
-                *shell,
+                crate::resolve::shell(*shell)?,
                 &mut App::command(),
                 "hopper",
                 &mut std::io::stdout(),
@@ -551,6 +551,41 @@ pub async fn run(app: &App) -> Result<i32> {
                 cache: &crate::cache_dir()?,
             })
             .await
+        }
+        Action::Configure {
+            name,
+            java_major: None,
+            channel: None,
+            pack_version: None,
+            update: None,
+            restart: None,
+            warn: None,
+            rcon_firewall_confirmed: false,
+        } if crate::prompt::enabled() => {
+            let record = crate::resolve::instance(
+                app.scope,
+                name.as_deref(),
+                crate::resolve::Need::Change,
+                "configure",
+            )?;
+            let settings = crate::resolve::configure(&record).await?;
+            if settings.is_empty() {
+                println!("Nothing changed.");
+                return Ok(0);
+            }
+            instance_action(
+                app,
+                &Action::Configure {
+                    name: Some(record.name),
+                    java_major: settings.java_major,
+                    channel: settings.channel,
+                    pack_version: settings.pack_version,
+                    update: settings.update,
+                    restart: settings.restart,
+                    warn: settings.warn,
+                    rcon_firewall_confirmed: false,
+                },
+            )
         }
         other => instance_action(app, other),
     }
@@ -1085,7 +1120,18 @@ async fn create_instance(
             *path = path.canonicalize().context("reading source archive")?;
         }
         managed::prepare(&mut record)?;
-        let code = managed::invoke(&record, "install", &[])?;
+        let mut code = managed::invoke(&record, "install", &[])?;
+        // The worker cannot ask; it declines a pack without a server build. Ask here, once,
+        // and keep the answer, since every later update needs the same consent.
+        if code == crate::cli::exit::DECLINED
+            && record.source.provider == Provider::Curseforge
+            && !record.runtime.allow_client_pack
+            && crate::prompt::agree("Client pack", "build from client files, also for updates")?
+        {
+            record.runtime.allow_client_pack = true;
+            managed::save(&record)?;
+            code = managed::invoke(&record, "install", &[])?;
+        }
         ensure!(
             code == 0,
             "pack installation failed ({code}); run hopper repair {}",
@@ -1194,7 +1240,8 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
                 record.runtime.java_major = Some(*major);
             }
             if let Some(channel) = channel {
-                record.source.channel = Some(channel.clone());
+                // Stable is the default and is recorded as such.
+                record.source.channel = Some(channel.clone()).filter(|c| c != "stable");
                 record.source.pack_version = None;
             }
             if let Some(pin) = pack_version {

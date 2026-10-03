@@ -574,11 +574,13 @@ async fn ask_pack(
     prompt::search::search(search).await
 }
 
-/// The release to track: `(channel, pin)`. Not asked when only one answer makes sense.
+/// The release to track: `(channel, pin, rows left on screen)`. Unless `always`, not asked
+/// when only one answer makes sense. Without the network, a pin is typed.
 async fn ask_release(
     found: &Option<Discovery>,
     provider: Provider,
     pack: Option<&str>,
+    always: bool,
 ) -> Result<(Option<String>, Option<String>, usize)> {
     let sep = prompt::sep();
     let releases = match (found, provider, pack) {
@@ -594,30 +596,30 @@ async fn ask_release(
             prompt::unbusy();
             r?
         }
-        _ if provider != Provider::Gtnh => return Ok((None, None, 0)),
+        (_, Provider::Mrpack, _) => return Ok((None, None, 0)),
         _ => vec![],
     };
+    let known = !releases.is_empty();
     let stable = releases.iter().find(|r| r.stable);
     let testing = releases
         .iter()
         .find(|r| !r.stable && stable.is_none_or(|s| r.published > s.published));
-    let label = |r: Option<&discover::Release>| r.map(|r| r.label.clone()).unwrap_or_default();
+    let label = |r: Option<&discover::Release>, what: &str| match r {
+        Some(r) => format!("{} {sep} {what}", r.label),
+        None => what.to_owned(),
+    };
     let mut items = vec![];
-    if stable.is_some() || provider == Provider::Gtnh {
-        items.push(
-            Item::new("stable", "stable").hint(format!("{} {sep} recommended", label(stable))),
-        );
+    if stable.is_some() || !known {
+        items.push(Item::new("stable", "stable").hint(label(stable, "recommended")));
     }
-    if testing.is_some() || (provider == Provider::Gtnh && releases.is_empty()) {
-        items.push(
-            Item::new("testing", "testing").hint(format!("{} {sep} prereleases", label(testing))),
-        );
+    if testing.is_some() || !known || always {
+        items.push(Item::new("testing", "testing").hint(label(testing, "prereleases")));
     }
     if provider == Provider::Gtnh {
         items.push(Item::new("daily", "daily").hint("development builds"));
         items.push(Item::new("experimental", "experimental").hint("development builds"));
     }
-    if items.len() <= 1 {
+    if items.len() <= 1 && !always {
         // Nothing newer than stable: there is no choice to make.
         return Ok(match items.first() {
             Some(_) => (None, None, 0),
@@ -625,14 +627,7 @@ async fn ask_release(
             None => bail!("this pack has no releases"),
         });
     }
-    if !releases.is_empty() {
-        items.push(Item::new("pin...", "pin").hint("one exact version, never updated"));
-    }
-    let choice = prompt::select("Version", &items, Some(0))?;
-    if choice != "pin" {
-        let channel = (choice != "stable").then(|| choice.to_owned());
-        return Ok((channel, None, 1));
-    }
+    items.push(Item::new("pin...", "pin").hint("one exact version, never updated"));
     let versions: Vec<Item<String>> = releases
         .iter()
         .map(|r| {
@@ -642,13 +637,30 @@ async fn ask_release(
             Item::new(r.label.clone(), r.id.clone()).hint(format!("{kind} {sep} {mc} {sep} {date}"))
         })
         .collect();
-    match prompt::select("Pin", &versions, Some(0)) {
-        Ok(pin) => Ok((None, Some(pin), 2)),
-        Err(e) if e.is::<prompt::Back>() => {
-            prompt::rewind(1);
-            Err(e)
+    loop {
+        let choice = prompt::select("Version", &items, Some(0))?;
+        if choice != "pin" {
+            let channel = (choice != "stable").then(|| choice.to_owned());
+            return Ok((channel, None, 1));
         }
-        Err(e) => Err(e),
+        let pin = if known {
+            prompt::select("Pin", &versions, Some(0))
+        } else {
+            let check = |v: &str| {
+                anyhow::ensure!(
+                    !v.is_empty() && !v.contains(['/', '\\', '\n', '\r']),
+                    "an exact version or registry version ID"
+                );
+                Ok(())
+            };
+            prompt::text("Pin", None, &check)
+        };
+        match pin {
+            Ok(pin) => return Ok((None, Some(pin), 2)),
+            // Back from the version list returns to the channel question.
+            Err(e) if e.is::<prompt::Back>() => prompt::rewind(1),
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -742,7 +754,7 @@ pub async fn install(app: &App, create: &Create, from: Option<Option<&Path>>) ->
                 && args.collection.is_none() =>
             {
                 let provider = args.provider.expect("pack step settles the provider");
-                ask_release(&found, provider, args.pack.as_deref())
+                ask_release(&found, provider, args.pack.as_deref(), false)
                     .await
                     .map(|(channel, pin, rows)| {
                         args.channel = channel;
@@ -987,4 +999,245 @@ mod install_tests {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------- configure
+
+/// What `configure` would be given as flags.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Settings {
+    pub java_major: Option<u32>,
+    pub channel: Option<String>,
+    pub pack_version: Option<String>,
+    pub update: Option<String>,
+    pub restart: Option<String>,
+    pub warn: Option<u32>,
+}
+
+impl Settings {
+    pub fn is_empty(&self) -> bool {
+        *self == Settings::default()
+    }
+}
+
+fn target_of(channel: Option<&str>, pin: Option<&str>) -> String {
+    match (pin, channel) {
+        (Some(pin), _) => format!("pinned {pin}"),
+        (None, Some(channel)) => channel.to_owned(),
+        (None, None) => "stable".to_owned(),
+    }
+}
+
+fn ask_schedule(key: &str, current: &str) -> Result<(String, usize)> {
+    let presets = ["off", "hourly", "daily", "weekly"];
+    let mut items: Vec<Item<&str>> = presets.iter().map(|p| Item::new(*p, *p)).collect();
+    items.push(Item::new("custom...", "custom").hint("a systemd OnCalendar expression"));
+    let at = presets
+        .iter()
+        .position(|p| *p == current)
+        .unwrap_or(presets.len());
+    loop {
+        match prompt::select(key, &items, Some(at))? {
+            "custom" => {
+                let default = (!presets.contains(&current)).then_some(current);
+                match prompt::text(key, default, &|v| managed::validate_schedule(v)) {
+                    Ok(v) => return Ok((v, 2)),
+                    Err(e) if e.is::<prompt::Back>() => prompt::rewind(1),
+                    Err(e) => return Err(e),
+                }
+            }
+            preset => return Ok((preset.to_owned(), 1)),
+        }
+    }
+}
+
+fn parse_warn(text: &str) -> Result<u32> {
+    let seconds: u32 = text
+        .trim()
+        .trim_end_matches('s')
+        .parse()
+        .context("seconds, e.g. 300")?;
+    anyhow::ensure!(seconds <= 86400, "at most a day (86400)");
+    Ok(seconds)
+}
+
+/// One list of the current settings; Enter edits one, `save` ends. `None` if nothing changed.
+pub async fn configure(record: &Instance) -> Result<Settings> {
+    let found = if managed::is_root() {
+        None
+    } else {
+        Discovery::new().ok()
+    };
+    let gtnh = record.source.provider == Provider::Gtnh;
+    let mut target = (
+        record.source.channel.clone(),
+        record.source.pack_version.clone(),
+    );
+    let mut update = record.update.clone();
+    let mut restart = record.restart.clone();
+    let mut warn = record.warn;
+    let mut java = record.runtime.java_major;
+    let mut cursor = 0;
+    loop {
+        let was = |old: String, new: String| {
+            if old == new {
+                new
+            } else {
+                format!("{new}  (was {old})")
+            }
+        };
+        let old_target = target_of(
+            record.source.channel.as_deref(),
+            record.source.pack_version.as_deref(),
+        );
+        let new_target = target_of(target.0.as_deref(), target.1.as_deref());
+        let mut items = vec![];
+        if record.source.provider != Provider::Mrpack && record.source.collection.is_none() {
+            items.push(
+                Item::new("Target", "target").hint(was(old_target.clone(), new_target.clone())),
+            );
+        }
+        items.push(Item::new("Update", "update").hint(was(record.update.clone(), update.clone())));
+        items.push(
+            Item::new("Restart", "restart").hint(was(record.restart.clone(), restart.clone())),
+        );
+        items.push(
+            Item::new("Warn", "warn").hint(was(format!("{}s", record.warn), format!("{warn}s"))),
+        );
+        if gtnh {
+            let show = |j: Option<u32>| j.map_or("pack default".to_owned(), |j| j.to_string());
+            items.push(
+                Item::new("Java", "java").hint(was(show(record.runtime.java_major), show(java))),
+            );
+        }
+        let changes = usize::from(new_target != old_target)
+            + usize::from(update != record.update)
+            + usize::from(restart != record.restart)
+            + usize::from(warn != record.warn)
+            + usize::from(java != record.runtime.java_major);
+        items.push(Item::new("Save", "save").hint(match changes {
+            0 => "nothing changed".to_owned(),
+            1 => "1 change".to_owned(),
+            n => format!("{n} changes"),
+        }));
+        let pick = prompt::select("Configure", &items, Some(cursor.min(items.len() - 1)))?;
+        cursor = items.iter().position(|i| i.value == pick).unwrap_or(0);
+        if pick == "save" {
+            break;
+        }
+        // The menu stays the one place answers live: take back its row and the edit's.
+        prompt::rewind(1);
+        let rows = match pick {
+            "target" => ask_release(
+                &found,
+                record.source.provider,
+                record.source.pack.as_deref(),
+                true,
+            )
+            .await
+            .map(|(channel, pin, rows)| {
+                target = (channel, pin);
+                rows
+            }),
+            "update" => ask_schedule("Update", &update).map(|(v, rows)| {
+                update = v;
+                rows
+            }),
+            "restart" => ask_schedule("Restart", &restart).map(|(v, rows)| {
+                restart = v;
+                rows
+            }),
+            "warn" => {
+                let current = warn.to_string();
+                prompt::text("Warn", Some(&current), &|t| parse_warn(t).map(|_| ())).map(|t| {
+                    warn = parse_warn(&t).expect("validated");
+                    1
+                })
+            }
+            _ => {
+                let majors: Vec<Item<u32>> = [8, 17, 21, 25]
+                    .iter()
+                    .map(|j| Item::new(j.to_string(), *j))
+                    .collect();
+                let at = java.and_then(|j| [8, 17, 21, 25].iter().position(|m| *m == j));
+                prompt::select("Java", &majors, at.or(Some(2))).map(|j| {
+                    java = Some(j);
+                    1
+                })
+            }
+        };
+        match rows {
+            Ok(rows) => prompt::rewind(rows),
+            Err(e) if e.is::<prompt::Back>() => {}
+            Err(e) => return Err(e),
+        }
+    }
+    prompt::rewind(1);
+    let mut settings = Settings::default();
+    let show = |key: &str, old: String, new: String| {
+        if old != new {
+            eprintln!("{}", prompt::row(key, &format!("{old} -> {new}")));
+        }
+    };
+    let new_target = target_of(target.0.as_deref(), target.1.as_deref());
+    let old_target = target_of(
+        record.source.channel.as_deref(),
+        record.source.pack_version.as_deref(),
+    );
+    show("Target", old_target.clone(), new_target.clone());
+    show("Update", record.update.clone(), update.clone());
+    show("Restart", record.restart.clone(), restart.clone());
+    show("Warn", format!("{}s", record.warn), format!("{warn}s"));
+    if new_target != old_target {
+        match target {
+            (_, Some(pin)) => settings.pack_version = Some(pin),
+            (channel, None) => settings.channel = Some(channel.unwrap_or_else(|| "stable".into())),
+        }
+    }
+    if java != record.runtime.java_major {
+        show(
+            "Java",
+            record
+                .runtime
+                .java_major
+                .map_or("default".into(), |j| j.to_string()),
+            java.map_or("default".into(), |j| j.to_string()),
+        );
+        settings.java_major = java;
+    }
+    if update != record.update {
+        settings.update = Some(update);
+    }
+    if restart != record.restart {
+        settings.restart = Some(restart);
+    }
+    if warn != record.warn {
+        settings.warn = Some(warn);
+    }
+    Ok(settings)
+}
+
+/// `completions` at a terminal: the shell, defaulting to the login shell.
+pub fn shell(given: Option<clap_complete::Shell>) -> Result<clap_complete::Shell> {
+    use clap::ValueEnum;
+    if let Some(shell) = given {
+        return Ok(shell);
+    }
+    if !prompt::enabled() {
+        return Err(missing(
+            &["SHELL"],
+            "hopper completions bash|zsh|fish|elvish|powershell",
+        ));
+    }
+    let login = std::env::var("SHELL").ok().and_then(|s| {
+        let name = s.rsplit('/').next()?.to_owned();
+        clap_complete::Shell::from_str(&name, true).ok()
+    });
+    let shells = clap_complete::Shell::value_variants();
+    let items: Vec<Item<clap_complete::Shell>> = shells
+        .iter()
+        .map(|s| Item::new(s.to_string(), *s))
+        .collect();
+    let at = login.and_then(|l| shells.iter().position(|s| *s == l));
+    prompt::select("Shell", &items, at)
 }

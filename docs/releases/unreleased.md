@@ -1,0 +1,23 @@
+# Unreleased
+
+Interactive use at a terminal; scripts keep every argument mandatory.
+
+- Anything left out is asked at a terminal: instance pickers for every instance
+  command, live search across Modrinth and CurseForge for `install`, `search` and
+  `versions`, release choice only when there is one, mod pickers for `disable` and
+  `enable`, a settings editor for `configure`, the shell for `completions`.
+- The equivalent command is printed before anything runs whenever something was asked.
+- New confirmations at a terminal: `stop`/`restart` of a running server (with players
+  online), `remove`, applying `update` to a running server, `onboard`. Scripts and `-y`
+  proceed as before.
+- A CurseForge pack without a server pack asks whether to build from the client pack and
+  keeps the answer for updates.
+- New `--no-input` flag and `HOPPER_NO_INPUT`; `CI` also disables prompts.
+  `TERM=dumb` or `HOPPER_ACCESSIBLE=1` asks line by line. `TERM=dumb` disables colour.
+- `disable` and `enable` accept several files.
+
+Exit code changes:
+
+- A missing argument exits 2 and lists every missing flag. `install x --provider
+  modrinth` without `--pack` previously exited 1.
+- A declined EULA exits 3 (previously 1). Ctrl-C at a prompt exits 130.

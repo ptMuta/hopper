@@ -286,3 +286,67 @@ fn no_input_and_ci_never_prompt_even_at_a_terminal() {
     let pty = Pty::spawn(&["status", "--json"], root.path());
     assert_eq!(pty.finish(), 2);
 }
+
+#[test]
+fn configure_edits_settings_in_one_list() {
+    let root = tempfile::tempdir().unwrap();
+    record(root.path(), "alpha");
+    let mut pty = Pty::spawn(&["configure", "alpha"], root.path());
+    pty.wait_for("> Target");
+    pty.send(b"\x1b[B\r");
+    pty.wait_for("> off");
+    pty.send(b"\x1b[B\x1b[B\r");
+    pty.wait_for("daily  (was off)");
+    pty.send(b"\x1b[6~\r");
+    pty.wait_for("Update      off -> daily");
+    pty.finish();
+    let saved: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.path().join("config/hopper/instances/alpha.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["update"], "daily");
+}
+
+#[test]
+fn completions_offer_the_login_shell() {
+    let root = tempfile::tempdir().unwrap();
+    let mut cmd = command(&["completions"], root.path());
+    cmd.env("SHELL", "/usr/bin/fish");
+    let mut pty = Pty::spawn_with(cmd);
+    pty.wait_for("> fish");
+    pty.send(b"\r");
+    pty.wait_for("complete -c hopper");
+    assert_eq!(pty.finish(), 0);
+}
+
+#[test]
+fn sigterm_and_ctrl_z_give_the_terminal_back() {
+    let root = tempfile::tempdir().unwrap();
+    record(root.path(), "alpha");
+    record(root.path(), "beta");
+    let mut pty = Pty::spawn(&["status"], root.path());
+    let cooked = pty.termios().c_lflag;
+    pty.wait_for("> alpha");
+
+    // Ctrl-Z gives the terminal back and stops. This session leader has no shell to stop
+    // for (an orphaned group ignores SIGTSTP), so it carries on asking: what matters here
+    // is that the prompt survives and redraws.
+    pty.screen.clear();
+    pty.send(b"\x1a");
+    pty.wait_for("> alpha");
+    assert_ne!(pty.termios().c_lflag, cooked, "raw again");
+
+    unsafe { libc::kill(pty.child.id() as i32, libc::SIGTERM) };
+    let slave = pty.slave.try_clone().unwrap();
+    let code = pty.finish();
+    assert_eq!(
+        code, -1,
+        "terminated by the signal, as before the prompt existed"
+    );
+    let after = unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        libc::tcgetattr(slave.as_raw_fd(), &mut t);
+        t
+    };
+    assert_eq!(after.c_lflag, cooked, "cooked again after SIGTERM");
+}

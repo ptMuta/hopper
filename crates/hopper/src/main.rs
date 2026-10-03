@@ -1,7 +1,6 @@
 //! hopper — install and update Minecraft server modpacks from Modrinth.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -30,11 +29,13 @@ mod instances;
 mod interface;
 mod managed;
 mod migration;
+mod prompt;
 mod render;
 mod runtime;
 mod selfupdate;
 mod service;
 mod show;
+mod style;
 
 #[cfg(test)]
 use cli::Command;
@@ -44,6 +45,7 @@ fn main() {
     let cli = interface::App::parse();
     let code = match interface::run(&cli) {
         Ok(code) => code,
+        Err(e) if e.is::<prompt::Cancelled>() || e.is::<prompt::Back>() => exit::CANCELLED,
         Err(e) => {
             eprintln!("error: {e}");
             for cause in e.chain().skip(1) {
@@ -112,6 +114,12 @@ fn exit_code_for(e: &anyhow::Error) -> i32 {
         }
     }
 
+    if e.is::<prompt::Missing>() {
+        return exit::USAGE;
+    }
+    if e.is::<prompt::Declined>() {
+        return exit::DECLINED;
+    }
     // The wrapper enums are matched explicitly: `#[error(transparent)]` forwards `source()`
     // past the wrapped error, so it never appears in the chain on its own.
     for cause in e.chain() {
@@ -176,7 +184,7 @@ async fn run(cli: &Cli) -> Result<i32> {
             let mut script = Vec::new();
             clap_complete::generate(*shell, &mut cmd, "hopper", &mut script);
             // A reader that stops early (`| head`) is not an error worth a panic.
-            let _ = std::io::stdout().write_all(&script);
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), &script);
             Ok(exit::OK)
         }
         None => install(cli).await,
@@ -471,7 +479,7 @@ async fn install(cli: &Cli) -> Result<i32> {
         }
         SourceSpec::CurseForge { slug, version } => {
             let version = version.as_deref();
-            match curseforge::resolve(slug, version, &store, &cf_opts, confirm).await? {
+            match curseforge::resolve(slug, version, &store, &cf_opts, prompt::consent).await? {
                 curseforge::Outcome::Declined => {
                     println!("Aborted. Nothing changed.");
                     return Ok(exit::DECLINED);
@@ -485,49 +493,50 @@ async fn install(cli: &Cli) -> Result<i32> {
             }
         }
         _ => {
-            let archive = match load_archive(&spec, &client, cli.global.quiet, wanted_mc.as_ref())
-                .await
-            {
-                Ok(a) => a,
-                // A bare slug Modrinth does not know may be a CurseForge pack.
-                Err(e) if is_not_found(&e) => {
-                    let SourceSpec::Ambiguous { token, version } = &spec else {
-                        return Err(e);
-                    };
-                    if cf_key.is_none() {
-                        eprintln!("error: {e:#}\n");
-                        eprintln!(
-                            "help: if {token:?} is a CurseForge pack, set a CurseForge API key:"
-                        );
-                        curseforge::missing_key_help();
-                        return Ok(exit::GENERIC);
-                    }
-                    if !cli.global.quiet {
-                        println!("note: {token:?} is not on Modrinth; looking on CurseForge");
-                    }
-                    let version = version.as_deref();
-                    match curseforge::resolve(token, version, &store, &cf_opts, confirm).await? {
-                        curseforge::Outcome::Declined => {
-                            println!("Aborted. Nothing changed.");
-                            return Ok(exit::DECLINED);
+            let archive =
+                match load_archive(&spec, &client, cli.global.quiet, wanted_mc.as_ref()).await {
+                    Ok(a) => a,
+                    // A bare slug Modrinth does not know may be a CurseForge pack.
+                    Err(e) if is_not_found(&e) => {
+                        let SourceSpec::Ambiguous { token, version } = &spec else {
+                            return Err(e);
+                        };
+                        if cf_key.is_none() {
+                            eprintln!("error: {e:#}\n");
+                            eprintln!(
+                                "help: if {token:?} is a CurseForge pack, set a CurseForge API key:"
+                            );
+                            curseforge::missing_key_help();
+                            return Ok(exit::GENERIC);
                         }
-                        curseforge::Outcome::Resolved(r) => {
-                            let r = *r;
-                            source_arg = match version {
-                                Some(v) => format!("cf:{token}@{v}"),
-                                None => format!("cf:{token}"),
-                            };
-                            let out = (r.pack.clone(), r.overrides.clone());
-                            cf_source = Some(r);
-                            return finish_install(
-                                cli, existing, source_arg, out, cf_source, &store, &client,
-                            )
-                            .await;
+                        if !cli.global.quiet {
+                            println!("note: {token:?} is not on Modrinth; looking on CurseForge");
+                        }
+                        let version = version.as_deref();
+                        match curseforge::resolve(token, version, &store, &cf_opts, prompt::consent)
+                            .await?
+                        {
+                            curseforge::Outcome::Declined => {
+                                println!("Aborted. Nothing changed.");
+                                return Ok(exit::DECLINED);
+                            }
+                            curseforge::Outcome::Resolved(r) => {
+                                let r = *r;
+                                source_arg = match version {
+                                    Some(v) => format!("cf:{token}@{v}"),
+                                    None => format!("cf:{token}"),
+                                };
+                                let out = (r.pack.clone(), r.overrides.clone());
+                                cf_source = Some(r);
+                                return finish_install(
+                                    cli, existing, source_arg, out, cf_source, &store, &client,
+                                )
+                                .await;
+                            }
                         }
                     }
-                }
-                Err(e) => return Err(e),
-            };
+                    Err(e) => return Err(e),
+                };
             let pack = mrpack::read(std::io::Cursor::new(&archive), &HostAllowlist::packs())
                 .context("reading the modpack")?;
             let overrides =
@@ -1726,25 +1735,18 @@ fn accept_eula(root: &Path) -> Result<()> {
 /// Never assumed: `--yes` and non-interactive runs only explain how, since agreeing to a
 /// licence on someone's behalf because they skipped prompts is not defensible. Only an explicit
 /// answer of yes accepts.
-fn offer_eula(root: &Path, yes: bool) -> Result<bool> {
-    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    if yes || !interactive {
+fn offer_eula(root: &Path, _yes: bool) -> Result<bool> {
+    if !prompt::enabled() {
         println!("\n  note: the Minecraft EULA has not been accepted, so the server");
         println!("        will not start. Accept it with:  hopper --eula");
         println!("        {}", hopper_core::server::EULA_URL);
         return Ok(false);
     }
-    println!(
-        "\nThe server only starts once you accept the Minecraft EULA:\n  {}",
+    if prompt::consent(&format!(
+        "Accept the Minecraft EULA? {}",
         hopper_core::server::EULA_URL
-    );
-    print!("Do you accept it? [y/N] ");
-    std::io::stdout().flush().ok();
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    if matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+    ))? {
         accept_eula(root)?;
-        println!("  Accepted.");
         Ok(true)
     } else {
         println!("  Not accepted. When you are ready:  hopper --eula");
@@ -1788,18 +1790,16 @@ fn lockfile_template(pack: &Mrpack, source_arg: &str, previous: Option<&Lockfile
     }
 }
 
-fn confirm(prompt: &str) -> Result<bool> {
-    // Non-interactive input cannot answer, and assuming yes would be the dangerous default.
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        println!("{prompt} not a terminal, so nothing was applied. Re-run with --yes.");
+fn confirm(question: &str) -> Result<bool> {
+    // Nobody to answer, and assuming yes would be the dangerous default.
+    if !prompt::enabled() {
+        println!(
+            "{} not a terminal, so nothing was applied. Re-run with --yes.",
+            question.trim()
+        );
         return Ok(false);
     }
-    print!("{prompt} [Y/n] ");
-    std::io::stdout().flush().ok();
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    let a = line.trim().to_ascii_lowercase();
-    Ok(a.is_empty() || a == "y" || a == "yes")
+    prompt::ask(question.trim(), true)
 }
 
 fn cache_dir() -> Result<PathBuf> {

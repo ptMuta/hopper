@@ -5,7 +5,6 @@
 //! there is one. Piped, `--plain` or `NO_COLOR` output drops the art and colour and keeps
 //! `key: value` lines, so it can be grepped or pasted.
 
-use std::io::IsTerminal;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -143,7 +142,7 @@ pub fn run(dir: &Path, plain: bool) -> Result<i32> {
     }
     add("Path", dir.display().to_string());
 
-    let color = !plain && std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let color = !plain && crate::style::stdout();
     if !color {
         for f in &fields {
             println!("{}: {}", f.key.to_ascii_lowercase(), f.value);

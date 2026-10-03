@@ -362,6 +362,8 @@ pub mod exit {
     /// Success, or nothing to do.
     pub const OK: i32 = 0;
     pub const GENERIC: i32 = 1;
+    /// Required input was missing and nobody could be asked for it.
+    pub const USAGE: i32 = 2;
     /// The operator declined.
     pub const DECLINED: i32 = 3;
     pub const NETWORK: i32 = 4;
@@ -369,6 +371,8 @@ pub mod exit {
     pub const SECURITY: i32 = 5;
     /// `--dry-run` found pending changes.
     pub const CHANGES_PENDING: i32 = 10;
+    /// Ctrl-C or Esc at a prompt; nothing changed.
+    pub const CANCELLED: i32 = 130;
 }
 
 #[cfg(test)]

@@ -478,7 +478,8 @@ fn worker_command(record: &Instance, operation: &str, args: &[String]) -> Result
         .arg(format!(
             "--setenv=HOPPER_CACHE_DIR={}",
             record.cache()?.display()
-        ));
+        ))
+        .arg("--setenv=HOPPER_NO_INPUT=1");
         let key = credential_path(record)?;
         if key.exists() {
             cmd.arg(format!(
@@ -491,7 +492,8 @@ fn worker_command(record: &Instance, operation: &str, args: &[String]) -> Result
     } else {
         let mut cmd = Command::new(executable);
         cmd.env("HOPPER_DATA_DIR", &record.root)
-            .env("HOPPER_CACHE_DIR", record.cache()?);
+            .env("HOPPER_CACHE_DIR", record.cache()?)
+            .env("HOPPER_NO_INPUT", "1");
         // Workers must use the same registry root, not the toolchain data override.
         cmd.env("HOPPER_INSTANCE_ROOT", data_root(Scope::User)?);
         let key = credential_path(record)?;

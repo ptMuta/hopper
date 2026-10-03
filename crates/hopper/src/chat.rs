@@ -99,7 +99,7 @@ pub fn run(dir: &Path, name: Option<&str>) -> Result<i32> {
         .or_else(|| std::env::var("USER").ok())
         .unwrap_or_else(|| "server".to_owned());
     let style = Style {
-        on: std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+        on: crate::style::stdout(),
     };
     let screen = Screen {
         interactive: style.on && std::io::stdin().is_terminal(),

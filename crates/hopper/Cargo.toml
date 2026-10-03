@@ -16,7 +16,7 @@ hopper-core = { path = "../hopper-core", version = "0.2.1" }
 clap.workspace = true
 clap_complete.workspace = true
 anyhow.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net"] }
 url.workspace = true
 serde.workspace = true
 serde_json.workspace = true

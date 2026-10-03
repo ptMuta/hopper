@@ -218,7 +218,7 @@ pub async fn resolve(
         eprintln!("note: a real run will ask before building from the client pack; unattended,");
         eprintln!("      pass --allow-client-pack.\n");
         true
-    } else if opts.yes || !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+    } else if opts.yes || !crate::prompt::enabled() {
         // --yes means "no prompts", not "agree to a different kind of install".
         eprintln!("help: this needs an explicit yes. Re-run with --allow-client-pack to build");
         eprintln!("      from the client pack unattended.");

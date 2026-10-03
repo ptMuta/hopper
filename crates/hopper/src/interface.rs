@@ -1,5 +1,4 @@
 //! Public, explicit instance CLI. The directory-oriented engine is an implementation detail.
-use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -27,6 +26,10 @@ pub struct App {
     pub verbose: bool,
     #[arg(long, global = true)]
     pub json: bool,
+    /// Never ask; fail listing missing flags instead (also HOPPER_NO_INPUT=1 or CI).
+    /// HOPPER_ACCESSIBLE=1 asks numbered questions line by line instead of drawing menus.
+    #[arg(long, global = true)]
+    pub no_input: bool,
     #[command(subcommand)]
     pub command: Option<Action>,
 }
@@ -344,6 +347,16 @@ pub enum Action {
 #[tokio::main(flavor = "current_thread")]
 pub async fn run(app: &App) -> Result<i32> {
     crate::service::set_scope(app.scope);
+    let hidden = matches!(
+        app.command,
+        Some(
+            Action::Worker { .. }
+                | Action::Maintenance { .. }
+                | Action::StartCheck { .. }
+                | Action::StopWorker { .. }
+        )
+    );
+    crate::prompt::init(app.no_input, app.json, app.yes, hidden);
     let Some(action) = &app.command else {
         App::command().print_help()?;
         println!();
@@ -941,13 +954,13 @@ async fn create_instance(
     let existing_eula = onboarding.is_some_and(|(from, _, _)| crate::eula_accepted(from));
     let accepted = existing_eula
         || create.eula
-        || (!app.yes
-            && std::io::stdin().is_terminal()
-            && crate::confirm("Accept the Minecraft EULA (https://aka.ms/MinecraftEULA)?")?);
-    ensure!(
-        accepted,
-        "EULA acceptance is required: pass --eula (not --yes)"
-    );
+        || crate::prompt::consent("Accept the Minecraft EULA? https://aka.ms/MinecraftEULA")?;
+    if !accepted {
+        return Err(crate::prompt::Declined(
+            "EULA acceptance is required: pass --eula (--yes never accepts it)".into(),
+        )
+        .into());
+    }
     if let Some((from, installed, backup)) = onboarding {
         crate::migration::onboard(app, &mut record, from, installed, backup).await?;
     } else {
@@ -976,11 +989,8 @@ async fn create_instance(
         record.scope,
         record.server().display()
     );
-    let start = create.start
-        || (!app.yes
-            && !app.quiet
-            && std::io::stdin().is_terminal()
-            && crate::confirm("Start now? You can edit configs first.")?);
+    let start =
+        create.start || (crate::prompt::enabled() && crate::prompt::ask("Start now?", false)?);
     if start {
         drop(_guard);
         managed::start(&mut record, create.rcon_firewall_confirmed)?;

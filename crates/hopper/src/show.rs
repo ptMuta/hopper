@@ -34,8 +34,9 @@ pub fn run(dir: &Path, plain: bool) -> Result<i32> {
     let dir = dir
         .canonicalize()
         .with_context(|| format!("{} does not exist", dir.display()))?;
-    let lock = crate::read_lockfile(&dir)?
-        .context("hopper did not install this directory; run `hopper <pack>` there first")?;
+    let lock = crate::read_lockfile(&dir)?.context(
+        "missing installation lock; use hopper repair NAME or onboard the existing installation",
+    )?;
     let props = std::fs::read_to_string(dir.join("server.properties")).unwrap_or_default();
     let port: u16 = properties::get(&props, "server-port")
         .and_then(|p| p.parse().ok())
@@ -138,7 +139,7 @@ pub fn run(dir: &Path, plain: bool) -> Result<i32> {
                 },
             );
         }
-        None => add("Service", "none · hopper service install".to_owned()),
+        None => add("Service", "missing · hopper repair NAME".to_owned()),
     }
     add("Path", dir.display().to_string());
 
@@ -184,8 +185,8 @@ pub fn run(dir: &Path, plain: bool) -> Result<i32> {
 /// How long the unit's server process has been running, e.g. `2h 14m`.
 fn uptime(unit: &str) -> Option<String> {
     let out = std::process::Command::new("systemctl")
+        .args(crate::service::scope_args())
         .args([
-            "--user",
             "show",
             unit,
             "--property",

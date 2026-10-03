@@ -1,6 +1,6 @@
 [package]
 name = "hopper-mc"
-description = "Install and update Minecraft server modpacks from Modrinth and CurseForge."
+description = "Manage Minecraft modpack servers from Modrinth, CurseForge and GTNH under systemd."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,7 +12,7 @@ name = "hopper"
 path = "src/main.rs"
 
 [dependencies]
-hopper-core = { path = "../hopper-core", version = "0.1.6" }
+hopper-core = { path = "../hopper-core", version = "0.2.0" }
 clap.workspace = true
 clap_complete.workspace = true
 anyhow.workspace = true
@@ -20,6 +20,10 @@ tokio.workspace = true
 url.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tar.workspace = true
+flate2.workspace = true
+zip.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

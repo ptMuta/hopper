@@ -108,6 +108,28 @@ pub fn write_atomic(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
     write_atomic_from(path, &mut &bytes[..], executable)
 }
 
+/// Atomic secret write: both temporary and final files are private from creation.
+pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    create_dir_all(parent)?;
+    let tmp = temp_sibling(path);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = at("create private file", &tmp, options.open(&tmp))?;
+    at("write private file", &tmp, file.write_all(bytes))?;
+    at("sync private file", &tmp, file.sync_all())?;
+    if let Err(error) = rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    fsync_dir(parent)
+}
+
 /// [`write_atomic`], streaming from a reader rather than holding the content in memory.
 pub fn write_atomic_from<R: io::Read>(path: &Path, reader: &mut R, executable: bool) -> Result<()> {
     let parent = path.parent().unwrap_or(Path::new("."));
@@ -254,6 +276,26 @@ mod tests {
         assert!(msg.contains("read"), "got {msg}");
         assert!(msg.contains("nope.txt"), "got {msg}");
         assert!(err.is_not_found());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn private_atomic_writes_replace_without_public_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp();
+        let path = dir.path().join("secret");
+        write_private_atomic(&path, b"first").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        write_private_atomic(&path, b"second").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

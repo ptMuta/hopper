@@ -50,7 +50,7 @@ pub struct Resolved {
 /// that installs it. These are the operator's alone, whatever the pack says, so they are never
 /// installed from a pack -- not even onto a fresh directory where nothing would be overwritten.
 pub fn is_access_list(path: &RelPath) -> bool {
-    crate::plan::reconcile::PROTECTED_FILES.contains(&path.as_str())
+    crate::plan::reconcile::is_protected(path)
 }
 
 impl Resolved {

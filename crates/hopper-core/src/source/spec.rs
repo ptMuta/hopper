@@ -15,8 +15,13 @@ use url::Url;
 ///
 /// Bare tokens stay `Ambiguous` rather than being guessed at, because telling a slug from a
 /// collection id needs a network lookup and this function is pure.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SourceSpec {
+    Gtnh {
+        channel: String,
+        version: Option<String>,
+        java_major: Option<u32>,
+    },
     /// A local `.mrpack`.
     File { path: String },
     /// A direct download.

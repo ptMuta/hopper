@@ -93,6 +93,27 @@ pub struct HostAllowlist {
 }
 
 impl HostAllowlist {
+    /// GTNH publishes its own server bundles and pinned GitHub/CurseForge assets.
+    pub fn gtnh() -> Self {
+        Self::new(
+            "GTNH downloads",
+            &[
+                "downloads.gtnewhorizons.com",
+                "api.github.com",
+                "github.com",
+                "raw.githubusercontent.com",
+                "mediafilez.forgecdn.net",
+                "edge.forgecdn.net",
+                "files.vexatos.com",
+                "nexus.gtnewhorizons.com",
+            ],
+        )
+        .with_redirects(&[
+            ("github.com", "release-assets.githubusercontent.com"),
+            ("github.com", "objects.githubusercontent.com"),
+            ("api.github.com", "release-assets.githubusercontent.com"),
+        ])
+    }
     pub fn packs() -> Self {
         Self::new("pack downloads", PACK_HOSTS).with_redirects(REDIRECT_TARGETS)
     }

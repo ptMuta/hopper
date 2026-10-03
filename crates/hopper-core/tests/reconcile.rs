@@ -555,6 +555,27 @@ fn protection_covers_worlds_logs_and_ban_lists() {
 }
 
 #[test]
+fn protected_paths_cannot_be_seeded_by_a_pack() {
+    let file = wanted("world/region/new.mca", d(1));
+    let decision = decide_hinted(
+        None,
+        None,
+        Some(&file),
+        Hints {
+            disabled_marker: false,
+            protected: true,
+        },
+    );
+    assert_eq!(
+        decision,
+        Decision::Reject {
+            reason: RejectReason::ProtectedPath
+        }
+    );
+    assert!(!decision.mutates());
+}
+
+#[test]
 fn a_disabled_mod_stays_disabled_across_updates() {
     // Renaming to `.disabled` is the manual override; an update must not silently undo it.
     let l = locked("mods/a.jar", d(1));

@@ -65,6 +65,15 @@ pub enum Outcome {
 pub fn api_key(flag: Option<&str>) -> Option<String> {
     flag.map(str::to_owned)
         .or_else(|| std::env::var(KEY_ENV).ok())
+        .or_else(|| {
+            std::env::var_os("CREDENTIALS_DIRECTORY").and_then(|dir| {
+                std::fs::read_to_string(std::path::PathBuf::from(dir).join("curseforge")).ok()
+            })
+        })
+        .or_else(|| {
+            std::env::var_os("HOPPER_CREDENTIAL_FILE")
+                .and_then(|path| std::fs::read_to_string(path).ok())
+        })
         .filter(|k| !k.trim().is_empty())
 }
 
@@ -72,8 +81,8 @@ pub fn missing_key_help() {
     eprintln!("help: CurseForge requires an API key for every request, and hopper does not ship");
     eprintln!("      one. Create one at https://console.curseforge.com/ and either export it:");
     eprintln!("        export {KEY_ENV}='...'");
-    eprintln!("      or pass --cf-api-key (visible to other users in `ps`, so prefer the");
-    eprintln!("      environment variable).");
+    eprintln!("      Scheduled updates store a private per-instance credential; it is never");
+    eprintln!("      passed to the Minecraft service or placed in command-line arguments.");
 }
 
 pub async fn resolve(

@@ -154,6 +154,8 @@ pub struct ConflictPolicy {
     pub restore_deleted: bool,
     /// Take ownership of an untracked file whose content differs, instead of refusing.
     pub adopt_collisions: bool,
+    /// Operator-declared world directories (including a custom level-name).
+    pub protected_dirs: Vec<String>,
 }
 
 impl Default for ConflictPolicy {
@@ -162,6 +164,7 @@ impl Default for ConflictPolicy {
             force: None,
             restore_deleted: true,
             adopt_collisions: false,
+            protected_dirs: Vec::new(),
         }
     }
 }
@@ -237,8 +240,8 @@ pub fn classify(t: &Triple<'_>, pol: &ConflictPolicy) -> Decision {
             _ => {}
         }
     }
-    // Protected paths are inert unless we are merely adding something that is not there.
-    if t.hints.protected && (t.disk.is_some() || t.want.is_none()) {
+    // Pack content must never seed or alter worlds and operator-owned protected paths.
+    if t.hints.protected {
         return Decision::Reject {
             reason: RejectReason::ProtectedPath,
         };
@@ -442,8 +445,7 @@ pub const PROTECTED_FILES: &[&str] = &[
 ];
 
 pub fn is_protected(path: &RelPath) -> bool {
-    // `world`, `world_nether`, `world_the_end`, and anything an operator named `world-backup`.
-    let first = path.segments().next().unwrap_or("");
+    let first = path.segments().next().unwrap_or("").to_ascii_lowercase();
     if first.starts_with("world") {
         return true;
     }
@@ -482,7 +484,11 @@ pub fn reconcile(
                 want: desired.get(&path),
                 hints: Hints {
                     disabled_marker: disk.has_disabled_marker(&path),
-                    protected: is_protected(&path),
+                    protected: is_protected(&path)
+                        || pol
+                            .protected_dirs
+                            .iter()
+                            .any(|dir| path.starts_with_dir(dir)),
                 },
             };
             let d = classify(&t, pol);

@@ -21,7 +21,7 @@ Examples:
 ";
 
 /// Install and update Minecraft server modpacks from Modrinth and CurseForge.
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(
     name = "hopper",
     version,
@@ -46,7 +46,7 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum Command {
     /// Show what is installed in this directory
     ///
@@ -175,6 +175,19 @@ pub struct GlobalArgs {
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct InstallArgs {
+    #[arg(skip)]
+    pub stage_only: bool,
+    // The public instance CLI supplies an explicit source; never infer a provider here.
+    #[arg(skip)]
+    pub source_override: Option<hopper_core::source::SourceSpec>,
+    #[arg(skip)]
+    pub native_java: Option<u32>,
+    #[arg(skip)]
+    pub native_launch: Option<hopper_core::loader::LaunchProfile>,
+    #[arg(skip)]
+    pub managed_launcher: bool,
+    #[arg(skip)]
+    pub collection_channel: Option<String>,
     /// Pack to install: a slug, a .mrpack file, a URL, a collection, or cf:<slug>
     ///
     /// Omit it to update the pack already installed in this directory.
@@ -260,7 +273,7 @@ pub struct InstallArgs {
     pub pack_changes_only: bool,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum ServiceAction {
     /// Write and enable systemd user units for the server in --dir
     ///
@@ -308,7 +321,7 @@ pub enum ServiceAction {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
 pub enum Loader {
     Fabric,
     NeoForge,
@@ -316,7 +329,7 @@ pub enum Loader {
     Quilt,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
 pub enum JavaVendorArg {
     /// GraalVM (default; faster JIT for long-running servers)
     Graalvm,

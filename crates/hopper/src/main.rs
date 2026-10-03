@@ -23,30 +23,26 @@ use hopper_core::source::{SourceSpec, spec::SpecError};
 mod chat;
 mod cli;
 mod curseforge;
+#[cfg(test)]
+mod engine_tests;
+mod gtnh;
 mod instances;
+mod interface;
+mod managed;
+mod migration;
 mod render;
 mod runtime;
 mod selfupdate;
 mod service;
 mod show;
 
-use cli::{Cli, Command, exit};
+#[cfg(test)]
+use cli::Command;
+use cli::{Cli, exit};
 
 fn main() {
-    // `hopper logs` hands everything after it to journalctl untouched. Parsed here, before
-    // clap, because hopper's own global flags (-n, -q, -v) would otherwise claim journalctl's.
-    if let Some((dir, args)) = logs_invocation(std::env::args().skip(1).collect()) {
-        let code = match service::logs(&dir, &args) {
-            Ok(code) => code,
-            Err(e) => {
-                eprintln!("error: {e:#}");
-                exit::GENERIC
-            }
-        };
-        std::process::exit(code);
-    }
-    let cli = Cli::parse();
-    let code = match run(&cli) {
+    let cli = interface::App::parse();
+    let code = match interface::run(&cli) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e}");
@@ -60,6 +56,7 @@ fn main() {
 }
 
 /// `[--dir DIR | -d DIR | --dir=DIR] logs ARGS...` -> (dir, ARGS).
+#[cfg(test)]
 fn logs_invocation(args: Vec<String>) -> Option<(PathBuf, Vec<String>)> {
     let mut dir = PathBuf::from(".");
     let mut i = 0;
@@ -149,6 +146,7 @@ fn exit_code_for(e: &anyhow::Error) -> i32 {
 }
 
 #[tokio::main(flavor = "current_thread")]
+#[cfg(test)]
 async fn run(cli: &Cli) -> Result<i32> {
     let root = &cli.global.dir;
 
@@ -168,26 +166,11 @@ async fn run(cli: &Cli) -> Result<i32> {
             })
             .await
         }
-        Some(Command::Service(action)) => match action {
-            cli::ServiceAction::Install { name, update, now } => {
-                service::install(&service::InstallOptions {
-                    dir: root,
-                    name: name.as_deref(),
-                    update: update.as_deref(),
-                    now: *now,
-                    quiet: cli.global.quiet,
-                })
-            }
-            cli::ServiceAction::Remove { name } => {
-                service::remove(root, name.as_deref(), cli.global.quiet)
-            }
-            cli::ServiceAction::RunUpdate { dir, unit } => service::run_update(dir, unit),
-            cli::ServiceAction::StopServer { dir, pid } => service::stop_server(dir, *pid),
-        },
+        Some(Command::Service(_)) => bail!("service orchestration belongs to the instance CLI"),
         Some(Command::Console { command }) => service::console(root, command),
         Some(Command::Show { plain }) => show::run(root, *plain),
         Some(Command::Chat { name }) => chat::run(root, name.as_deref()),
-        Some(Command::Logs { args }) => service::logs(root, args),
+        Some(Command::Logs { .. }) => bail!("logs belong to the instance CLI"),
         Some(Command::Completions { shell }) => {
             let mut cmd = <Cli as clap::CommandFactory>::command();
             let mut script = Vec::new();
@@ -242,7 +225,6 @@ fn status(root: &Path) -> Result<i32> {
     }
     println!("  Updated     {}", lock.updated_at);
     println!("  Source      {}", lock.pack.source_arg);
-    println!("\n  Check for updates:  hopper -n");
     Ok(exit::OK)
 }
 
@@ -304,6 +286,7 @@ fn toggle(root: &Path, name: &str, disable: bool) -> Result<i32> {
 
 // ---------------------------------------------------------------- repair
 
+#[cfg(test)]
 fn repair(root: &Path) -> Result<i32> {
     let journal = hopper_core::apply::execute::journal_path(root);
     if !journal.exists() {
@@ -336,7 +319,13 @@ async fn install(cli: &Cli) -> Result<i32> {
         }
     };
 
-    let spec = match SourceSpec::parse(&source_arg) {
+    let spec = match cli
+        .install
+        .source_override
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| SourceSpec::parse(&source_arg))
+    {
         Ok(s) => s,
         Err(e @ SpecError::WrongProjectType(..)) => {
             eprintln!("error: {e}");
@@ -442,6 +431,28 @@ async fn install(cli: &Cli) -> Result<i32> {
     let mut source_arg = source_arg;
     let mut cf_source: Option<curseforge::Resolved> = None;
 
+    if let SourceSpec::Gtnh {
+        channel,
+        version,
+        java_major,
+    } = &spec
+    {
+        let native = gtnh::resolve(channel, version.as_deref(), *java_major, &store).await?;
+        let mut native_cli = cli.clone();
+        native_cli.install.native_java = Some(native.java);
+        native_cli.install.native_launch = Some(native.launch);
+        return finish_install(
+            &native_cli,
+            existing,
+            source_arg,
+            (native.pack, native.content),
+            None,
+            &store,
+            &client,
+        )
+        .await;
+    }
+
     // A collection has no archive to download: it is a list of projects, and hopper picks
     // which versions of them to install. Everything downstream is identical, so it is turned
     // into a pack here rather than becoming a second code path. CurseForge packs likewise.
@@ -453,6 +464,7 @@ async fn install(cli: &Cli) -> Result<i32> {
                 wanted_mc.as_ref(),
                 cli.install.loader.map(Into::into),
                 cli.global.quiet,
+                cli.install.collection_channel.as_deref(),
             )
             .await?;
             (pack, Default::default())
@@ -660,7 +672,8 @@ async fn finish_install(
     //    --mods-only skips all of it, for a directory that already has a working server.
     // Remembered across runs: someone who installed with --mods-only must not get a loader
     // and a JVM appear underneath them on the next bare `hopper`.
-    let mods_only = cli.install.mods_only || existing.as_ref().is_some_and(|l| l.policy.mods_only);
+    let mods_only = cli.install.mods_only
+        || (!cli.install.managed_launcher && existing.as_ref().is_some_and(|l| l.policy.mods_only));
     let runtime = if mods_only {
         None
     } else {
@@ -706,12 +719,7 @@ async fn finish_install(
         interesting.extend(l.files.iter().map(|f| f.path.clone()));
     }
     let disk = scan(root, &interesting);
-    let decisions = reconcile(
-        existing.as_ref(),
-        &disk,
-        &desired,
-        &ConflictPolicy::default(),
-    );
+    let decisions = reconcile(existing.as_ref(), &disk, &desired, &world_policy(root)?);
     let summary = Summary::of(&decisions);
     let user_files = count_user_files(root, &existing);
 
@@ -725,13 +733,20 @@ async fn finish_install(
     // Accepting the EULA is independent of whether the pack needs changes: `hopper --eula`
     // on an already-current directory has to work, since that is how someone accepts it after
     // an unattended install.
-    if cli.install.eula {
+    if cli.install.eula && !cli.global.dry_run && !cli.install.stage_only {
         accept_eula(root)?;
         if !cli.global.quiet {
             println!("  accepted the Minecraft EULA");
         }
     }
 
+    let target_changed = existing.as_ref().is_some_and(|lock| {
+        lock.pack.version_label.as_deref() != Some(pack.index.version_id.as_str())
+            || cli
+                .install
+                .native_java
+                .is_some_and(|major| major != lock.server.java_major)
+    });
     if cli.install.pack_changes_only {
         // Putting back a missing file with the content it had is drift, not an update. A
         // restore with different content means the pack changed it too; so does everything
@@ -749,7 +764,7 @@ async fn finish_install(
         let pack_changed = decisions
             .iter()
             .any(|(path, d)| d.mutates() && !drift(path, d));
-        return Ok(if pack_changed || installer_pending {
+        return Ok(if pack_changed || installer_pending || target_changed {
             exit::CHANGES_PENDING
         } else {
             exit::OK
@@ -767,7 +782,7 @@ async fn finish_install(
         }
         return Ok(exit::CHANGES_PENDING);
     }
-    if !summary.changes_anything() {
+    if !summary.changes_anything() && !target_changed {
         return Ok(exit::OK);
     }
     if cli.global.dry_run {
@@ -827,7 +842,7 @@ async fn finish_install(
         );
     }
 
-    // 6. Apply.
+    // 6. Apply, or save an immutable fully-downloaded plan for maintenance.
     let mut template = lockfile_template(&pack, &source_arg, existing.as_ref());
     template.policy.mods_only = mods_only;
     if let Some(r) = &cf_source {
@@ -837,6 +852,16 @@ async fn finish_install(
         template.policy.client_pack_fallback = r.client_pack_fallback;
         template.policy.skip_blocked = r.skipped_blocked;
     }
+    if let Some(SourceSpec::Pack { slug, version }) = &cli.install.source_override {
+        template.pack.registry = Some(hopper_core::model::RegistryId::Modrinth);
+        template.pack.project_id = Some(slug.clone());
+        template.pack.file_id = version.clone();
+    }
+    if let Some(source) = &cli.install.source_override {
+        template
+            .unknown
+            .insert("resolved_source".into(), serde_json::to_value(source)?);
+    }
     template.policy.include_optional = include_optional;
     template.policy.force_include = includes;
     template.policy.force_exclude = excludes;
@@ -845,7 +870,17 @@ async fn finish_install(
         template.server.java_major = rt.java_major;
     }
     let start = match &runtime {
-        Some((rt, java)) => Some(plan_start_script(root, rt, java, existing.as_ref())?),
+        Some((rt, java)) => Some(plan_start_script_at(
+            root,
+            rt,
+            java,
+            existing.as_ref(),
+            if cli.install.managed_launcher {
+                ".hopper-launch.sh"
+            } else {
+                "start.sh"
+            },
+        )?),
         None => None,
     };
     template.server.start_script = match &start {
@@ -854,7 +889,25 @@ async fn finish_install(
             .as_ref()
             .and_then(|l| l.server.start_script.clone()),
     };
-    let next = next_lockfile(existing.as_ref(), &decisions, &entries, template);
+    let next = next_lockfile(existing.as_ref(), &decisions, &entries, template.clone());
+    if cli.install.stage_only {
+        hfs::create_dir_all(&root.join(".hopper"))?;
+        let prepared = PreparedInstall {
+            template,
+            entries,
+            start,
+            managed: cli.install.managed_launcher,
+            gtnh: cli.install.native_java.is_some(),
+            previous: existing.map(|l| l.to_json()).transpose()?,
+            committed: None,
+        };
+        hfs::write_atomic(
+            &root.join(".hopper/prepared.json"),
+            &serde_json::to_vec(&prepared)?,
+            false,
+        )?;
+        return Ok(exit::CHANGES_PENDING);
+    }
     let txn = format!("{}", std::process::id());
     let applied = apply(
         root,
@@ -869,7 +922,13 @@ async fn finish_install(
 
     // 7. Bootstrap: one start command regardless of loader.
     if let Some(start) = &start {
-        write_start_script(root, start, cli.global.quiet)?;
+        write_start_script(
+            root,
+            start,
+            cli.global.quiet,
+            cli.install.managed_launcher,
+            cli.install.native_java.is_some(),
+        )?;
     }
 
     // Recorded before choosing a port, so the next install on this machine steers clear of
@@ -912,13 +971,8 @@ async fn finish_install(
                 println!("    {f} — compare with your version, then delete it");
             }
         }
-        println!("\n{} is installed.", pack.index.name);
-        if runtime.is_some() {
-            println!("\n  Start it:      ./start.sh");
-        }
-        println!("  Update later:  hopper");
-        println!("  What's here:   hopper status");
-        if !eula_accepted(root) {
+        println!("\n{}: pack files are ready.", pack.index.name);
+        if !cli.install.managed_launcher && !eula_accepted(root) {
             offer_eula(root, cli.global.yes)?;
         }
     }
@@ -927,6 +981,145 @@ async fn finish_install(
 }
 
 // ---------------------------------------------------------------- helpers
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PreparedInstall {
+    template: Lockfile,
+    entries: BTreeMap<RelPath, LockedFile>,
+    start: Option<StartScript>,
+    managed: bool,
+    gtnh: bool,
+    previous: Option<String>,
+    #[serde(default)]
+    committed: Option<String>,
+}
+
+/// Apply the staged snapshot without a second network resolution. Reconcile after
+/// shutdown so edits during the warning period still receive normal protection.
+fn apply_prepared(root: &Path, cache: &Path) -> Result<i32> {
+    let mut prepared: PreparedInstall =
+        serde_json::from_slice(&std::fs::read(root.join(".hopper/prepared.json"))?)?;
+    let mut previous = read_lockfile(root)?;
+    let current = previous.as_ref().map(|l| l.to_json()).transpose()?;
+    let already_committed = prepared.committed.is_some() && current == prepared.committed;
+    anyhow::ensure!(
+        current == prepared.previous || already_committed,
+        "lockfile changed after staging; recheck instead of applying a stale snapshot"
+    );
+    if !already_committed {
+        let journal = hopper_core::apply::execute::journal_path(root);
+        if let Some(bytes) = hfs::read_optional(&journal)? {
+            let journal = hopper_core::apply::Journal::load(&bytes)?;
+            if prepared.committed.as_deref() == Some(journal.next_lock.to_json()?.as_str()) {
+                if let Some(previous) = &mut previous {
+                    for intent in &journal.intended {
+                        let path = intent.path.resolve_under(root);
+                        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file())
+                            && hfs::hash_file(&path).is_ok_and(|(_, d)| d == intent.digest)
+                        {
+                            if let Some(written) = journal.next_lock.file(&intent.path) {
+                                previous.files.retain(|f| f.path != intent.path);
+                                previous.files.push(written.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let launcher = root.join(if prepared.managed {
+        ".hopper-launch.sh"
+    } else {
+        "start.sh"
+    });
+    let original = prepared
+        .previous
+        .as_ref()
+        .map(|s| Lockfile::load(s.as_bytes()))
+        .transpose()?;
+    let edited = original
+        .as_ref()
+        .and_then(|l| l.server.start_script.as_ref())
+        .is_some_and(|digest| {
+            hfs::hash_file(&launcher).is_ok_and(|(_, current)| current != *digest)
+        });
+    if edited {
+        prepared.template.server.start_script = previous
+            .as_ref()
+            .and_then(|l| l.server.start_script.clone());
+    }
+    let mut desired = hopper_core::plan::DesiredSet::default();
+    for file in prepared.entries.values() {
+        desired.insert(hopper_core::plan::DesiredFile {
+            path: file.path.clone(),
+            content: file.digest.clone(),
+            size: Some(file.size),
+            executable: file.executable,
+            provenance: file.provenance.clone(),
+            managed: file.managed,
+        });
+    }
+    let mut paths: Vec<_> = desired.paths().cloned().collect();
+    if let Some(lock) = &previous {
+        paths.extend(lock.files.iter().map(|f| f.path.clone()));
+    }
+    let decisions = reconcile(
+        previous.as_ref(),
+        &scan(root, &paths),
+        &desired,
+        &world_policy(root)?,
+    );
+    let next = next_lockfile(
+        previous.as_ref(),
+        &decisions,
+        &prepared.entries,
+        prepared.template.clone(),
+    );
+    if !already_committed {
+        prepared.committed = Some(next.to_json()?);
+        hfs::write_atomic(
+            &root.join(".hopper/prepared.json"),
+            &serde_json::to_vec(&prepared)?,
+            false,
+        )?;
+        let store = BlobStore::new(cache);
+        apply(
+            root,
+            &decisions,
+            &next,
+            &store,
+            &std::process::id().to_string(),
+            &format!("hopper {}", env!("CARGO_PKG_VERSION")),
+            &now_rfc3339(),
+        )?;
+    }
+    if let Some(start) = prepared.start {
+        let start = if edited {
+            match start {
+                StartScript::Write { content, .. } | StartScript::KeepEdited { content } => {
+                    StartScript::KeepEdited { content }
+                }
+            }
+        } else {
+            start
+        };
+        write_start_script(root, &start, false, prepared.managed, prepared.gtnh)?;
+    }
+    std::fs::remove_file(root.join(".hopper/prepared.json"))?;
+    Ok(exit::OK)
+}
+
+fn world_policy(root: &Path) -> Result<ConflictPolicy> {
+    let mut policy = ConflictPolicy::default();
+    if let Ok(text) = std::fs::read_to_string(root.join("server.properties")) {
+        if let Some(world) = hopper_core::server::properties::get(&text, "level-name") {
+            RelPath::parse(world)
+                .context("level-name must be a relative path within this instance")?;
+            policy.protected_dirs.push(world.to_owned());
+        }
+    }
+    Ok(policy)
+}
 
 /// Fetch the raw `.mrpack` bytes for whatever the operator named.
 /// Fetch the raw `.mrpack` bytes for whatever the operator named.
@@ -951,7 +1144,7 @@ async fn load_archive(
         SourceSpec::Ambiguous { token, version } => {
             fetch_from_registry(client, token, version.as_deref(), mc, quiet).await?
         }
-        SourceSpec::Collection { .. } | SourceSpec::CurseForge { .. } => {
+        SourceSpec::Collection { .. } | SourceSpec::CurseForge { .. } | SourceSpec::Gtnh { .. } => {
             unreachable!("handled before load_archive")
         }
         SourceSpec::SharedInstance { .. } => {
@@ -1133,6 +1326,7 @@ async fn resolve_collection(
     wanted_mc: Option<&MinecraftVersion>,
     wanted_loader: Option<hopper_core::model::LoaderKind>,
     quiet: bool,
+    channel: Option<&str>,
 ) -> Result<Mrpack> {
     use hopper_core::api::modrinth::{API_V3, WireCollection, WireVersion};
     use hopper_core::model::LoaderKind;
@@ -1158,10 +1352,27 @@ async fn resolve_collection(
     // One request per project: collections have no batch version endpoint.
     let mut by_project = std::collections::BTreeMap::new();
     for project in &collection.projects {
-        let versions: Vec<WireVersion> =
+        let mut versions: Vec<WireVersion> =
             hopper_core::api::client::fetch_versions(client, project.as_str())
                 .await
                 .with_context(|| format!("listing versions of {project}"))?;
+        if let Some(channel) = channel {
+            versions.retain(|v| {
+                matches!(
+                    (channel, v.version_type),
+                    (
+                        "stable",
+                        Some(hopper_core::api::modrinth::VersionType::Release)
+                    ) | (
+                        "testing",
+                        Some(
+                            hopper_core::api::modrinth::VersionType::Beta
+                                | hopper_core::api::modrinth::VersionType::Alpha
+                        )
+                    )
+                )
+            });
+        }
         by_project.insert(project.clone(), versions);
     }
 
@@ -1246,15 +1457,25 @@ async fn resolve_runtime(
 ) -> Result<(runtime::Runtime, hopper_core::java::JavaPlan)> {
     let client = HttpClient::new(&user_agent(), HostAllowlist::runtimes())
         .context("building the runtime HTTP client")?;
-    let release = runtime::resolve_minecraft(&client, &pack.index.minecraft).await?;
+    let release = if cli.install.native_java.is_some() {
+        // GTNH's patched bootstrap declares its own JVM compatibility, not Mojang 1.7.10.
+        None
+    } else {
+        Some(runtime::resolve_minecraft(&client, &pack.index.minecraft).await?)
+    };
+    let major = cli
+        .install
+        .native_java
+        .or_else(|| release.as_ref().map(|r| r.java_major))
+        .context("missing runtime requirement")?;
 
     let java = runtime::plan_runtime_java(
-        release.java_major,
+        major,
         &pack.index.minecraft,
         cli.install.java.as_deref(),
         cli.install.java_vendor.map(Into::into),
     )?;
-    describe_java(&java, release.java_major, cli.global.quiet);
+    describe_java(&java, major, cli.global.quiet);
 
     // Provision before anything is written to the server directory, so a failure here leaves
     // it untouched.
@@ -1277,21 +1498,31 @@ async fn resolve_runtime(
         _ => None,
     };
     let cache_root = cache_dir()?;
-    let rt = runtime::resolve_loader(
-        &client,
-        store,
-        pack.index.loader,
-        pack.index.loader_version.as_deref(),
-        &pack.index.minecraft,
-        &release,
-        &runtime::LoaderEnv {
-            java: java_path.as_deref(),
-            cache_root: &cache_root,
-            quiet: cli.global.quiet,
-            run_installer: !cli.global.dry_run,
-        },
-    )
-    .await?;
+    let rt = if let Some(launch) = &cli.install.native_launch {
+        runtime::Runtime {
+            files: vec![],
+            launch: launch.clone(),
+            java_major: major,
+            loader_version: pack.index.loader_version.clone().unwrap_or_default(),
+            installer_pending: false,
+        }
+    } else {
+        runtime::resolve_loader(
+            &client,
+            store,
+            pack.index.loader,
+            pack.index.loader_version.as_deref(),
+            &pack.index.minecraft,
+            release.as_ref().context("missing Minecraft metadata")?,
+            &runtime::LoaderEnv {
+                java: java_path.as_deref(),
+                cache_root: &cache_root,
+                quiet: cli.global.quiet,
+                run_installer: !cli.global.dry_run,
+            },
+        )
+        .await?
+    };
     Ok((rt, java))
 }
 
@@ -1330,6 +1561,7 @@ fn describe_java(plan: &hopper_core::java::JavaPlan, major: u32, quiet: bool) {
 
 /// Emit `start.sh` and, on first install, `jvm.args`.
 /// What to do about `start.sh`, decided before apply so the lockfile can record it.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum StartScript {
     Write {
         content: String,
@@ -1343,11 +1575,22 @@ enum StartScript {
 ///
 /// Its header promises exactly this, so an edit is detected by comparing the file with what
 /// the lockfile says hopper wrote.
+#[cfg(test)]
 fn plan_start_script(
     root: &Path,
     runtime: &runtime::Runtime,
     java: &hopper_core::java::JavaPlan,
     previous: Option<&Lockfile>,
+) -> Result<StartScript> {
+    plan_start_script_at(root, runtime, java, previous, "start.sh")
+}
+
+fn plan_start_script_at(
+    root: &Path,
+    runtime: &runtime::Runtime,
+    java: &hopper_core::java::JavaPlan,
+    previous: Option<&Lockfile>,
+    launcher: &str,
 ) -> Result<StartScript> {
     use hopper_core::java::JavaPlan;
     use hopper_core::server::{JavaLocation, start_script};
@@ -1373,7 +1616,7 @@ fn plan_start_script(
     hasher.update(content.as_bytes());
     let (_, digest) = hasher.finish();
 
-    let path = root.join("start.sh");
+    let path = root.join(launcher);
     let on_disk = match hfs::kind_of(&path)? {
         hopper_core::fs::FileKind::Missing => None,
         hopper_core::fs::FileKind::File => Some(hfs::hash_file(&path)?.1),
@@ -1391,7 +1634,13 @@ fn plan_start_script(
     })
 }
 
-fn write_start_script(root: &Path, plan: &StartScript, quiet: bool) -> Result<()> {
+fn write_start_script(
+    root: &Path,
+    plan: &StartScript,
+    quiet: bool,
+    managed: bool,
+    gtnh: bool,
+) -> Result<()> {
     use hopper_core::server::{jvm_args_file, suggested_heap_gb};
 
     let jvm_args = root.join("jvm.args");
@@ -1400,7 +1649,15 @@ fn write_start_script(root: &Path, plan: &StartScript, quiet: bool) -> Result<()
         let total_gb = total_memory_gb();
         hfs::write_atomic(
             &jvm_args,
-            jvm_args_file(suggested_heap_gb(total_gb), Some(total_gb)).as_bytes(),
+            jvm_args_file(
+                if gtnh {
+                    suggested_heap_gb(total_gb).min(6)
+                } else {
+                    suggested_heap_gb(total_gb)
+                },
+                Some(total_gb),
+            )
+            .as_bytes(),
             false,
         )
         .context("writing jvm.args")?;
@@ -1408,11 +1665,23 @@ fn write_start_script(root: &Path, plan: &StartScript, quiet: bool) -> Result<()
 
     match plan {
         StartScript::Write { content, .. } => {
-            hfs::write_atomic(&root.join("start.sh"), content.as_bytes(), true)
-                .context("writing start.sh")?;
+            hfs::write_atomic(
+                &root.join(if managed {
+                    ".hopper-launch.sh"
+                } else {
+                    "start.sh"
+                }),
+                content.as_bytes(),
+                true,
+            )
+            .context("writing start.sh")?;
         }
         StartScript::KeepEdited { content } => {
-            let beside = root.join("start.sh.new");
+            let beside = root.join(if managed {
+                ".hopper-launch.sh.new"
+            } else {
+                "start.sh.new"
+            });
             if hfs::kind_of(&beside)? == hopper_core::fs::FileKind::Missing
                 || hfs::kind_of(&beside)? == hopper_core::fs::FileKind::File
             {
@@ -1664,6 +1933,96 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn staged_recovery_finishes_launcher_after_lock_commit() {
+        staged_launcher_recovery(true, false);
+    }
+
+    #[test]
+    fn staged_apply_preserves_launcher_edited_during_warning() {
+        staged_launcher_recovery(false, true);
+    }
+
+    fn staged_launcher_recovery(committed: bool, edited: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("server");
+        std::fs::create_dir_all(root.join(".hopper")).unwrap();
+        let cache = temp.path().join("cache");
+        let store = BlobStore::new(&cache);
+        let old_script = "#!/bin/sh\nexec true\n";
+        let new_script = "#!/bin/sh\n# updated launcher\nexec true\n";
+        let old_digest = store
+            .insert_bytes(old_script.as_bytes(), None)
+            .unwrap()
+            .digest;
+        let new_digest = store
+            .insert_bytes(new_script.as_bytes(), None)
+            .unwrap()
+            .digest;
+        let pack = Mrpack {
+            index: mrpack::MrpackIndex {
+                name: "test".into(),
+                version_id: "old".into(),
+                summary: None,
+                minecraft: MinecraftVersion::new("1.7.10"),
+                loader: hopper_core::model::LoaderKind::Forge,
+                loader_version: None,
+                files: vec![],
+            },
+            overrides: vec![],
+        };
+        let mut old = lockfile_template(&pack, "test", None);
+        old.server.start_script = Some(old_digest.clone());
+        let mut next = old.clone();
+        next.pack.version_label = Some("new".into());
+        next.server.start_script = Some(new_digest.clone());
+        let prepared = PreparedInstall {
+            template: next.clone(),
+            entries: BTreeMap::new(),
+            start: Some(StartScript::Write {
+                content: new_script.into(),
+                digest: new_digest,
+            }),
+            managed: true,
+            gtnh: false,
+            previous: Some(old.to_json().unwrap()),
+            committed: committed.then(|| next.to_json().unwrap()),
+        };
+        let current_script = if edited {
+            "#!/bin/sh\n# operator edit\nexec true\n"
+        } else {
+            old_script
+        };
+        std::fs::write(root.join(".hopper-launch.sh"), current_script).unwrap();
+        std::fs::write(
+            root.join(".hopper/lock.json"),
+            if committed {
+                next.to_json().unwrap()
+            } else {
+                old.to_json().unwrap()
+            },
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".hopper/prepared.json"),
+            serde_json::to_vec(&prepared).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(apply_prepared(&root, &cache).unwrap(), 0);
+        assert_eq!(
+            std::fs::read_to_string(root.join(".hopper-launch.sh")).unwrap(),
+            if edited { current_script } else { new_script }
+        );
+        if edited {
+            assert_eq!(
+                read_lockfile(&root).unwrap().unwrap().server.start_script,
+                Some(old_digest)
+            );
+            assert!(root.join(".hopper-launch.sh.new").is_file());
+        }
+        assert!(!root.join(".hopper/prepared.json").exists());
+    }
 
     #[test]
     fn timestamps_are_rfc3339() {

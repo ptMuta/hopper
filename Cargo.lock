@@ -555,7 +555,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hopper-core"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "flate2",
@@ -578,14 +578,17 @@ dependencies = [
 
 [[package]]
 name = "hopper-mc"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
  "clap_complete",
+ "flate2",
  "hopper-core",
+ "libc",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
  "tokio",
  "url",

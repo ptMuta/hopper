@@ -201,6 +201,15 @@ impl WireFile {
 
 /// Look a modpack up by slug.
 pub async fn find_modpack(client: &HttpClient, slug: &str) -> Result<WireMod, CurseForgeError> {
+    if let Ok(id) = slug.parse::<u64>() {
+        let result: Envelope<WireMod> = client.get_json(&format!("{API_V1}/mods/{id}")).await?;
+        if result.data.class_id != Some(CLASS_MODPACK) {
+            return Err(CurseForgeError::NotFound {
+                slug: slug.to_owned(),
+            });
+        }
+        return Ok(result.data);
+    }
     let url = format!(
         "{API_V1}/mods/search?gameId={GAME_MINECRAFT}&classId={CLASS_MODPACK}&slug={}",
         urlencode(slug)

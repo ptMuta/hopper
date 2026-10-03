@@ -430,8 +430,8 @@ fn written_at(line: &str, received: u64, utc_offset: i64) -> Option<u64> {
 /// The last day of the unit's journal, each line with its unix time in seconds.
 fn journal_history(unit: &str) -> Result<Vec<(u64, String)>> {
     let out = Command::new("journalctl")
+        .args(crate::service::scope_args())
         .args([
-            "--user",
             "--unit",
             unit,
             "--since",
@@ -476,8 +476,9 @@ fn parse_journal_json(line: &str) -> Option<(u64, String)> {
 /// Follow the unit's journal from now on. The child is stopped when the follower is dropped.
 fn follow_journal(unit: &str, tx: mpsc::Sender<String>) -> Result<Follower> {
     let mut child = Command::new("journalctl")
+        .args(crate::service::scope_args())
         .args([
-            "--user", "--unit", unit, "--follow", "--lines", "0", "--output", "cat",
+            "--unit", unit, "--follow", "--lines", "0", "--output", "cat",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

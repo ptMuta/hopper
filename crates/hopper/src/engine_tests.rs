@@ -1,0 +1,666 @@
+//! End-to-end tests against the built binary.
+//!
+//! The core crate's tests cover each stage; these cover the wiring between them, which is where
+//! a whole class of bug lives that unit tests cannot see. The one that prompted this file:
+//! override files were installed correctly but never recorded in the lockfile, so nothing could
+//! update or remove them afterwards — every component behaved, and the product did not.
+
+use clap::Parser;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+struct EngineCommand {
+    process: Command,
+    args: Vec<String>,
+}
+impl EngineCommand {
+    fn new() -> Self {
+        let mut process = Command::new(std::env::current_exe().unwrap());
+        process.args(["--exact", "engine_tests::engine_test_driver", "--nocapture"]);
+        process.env("HOPPER_ENGINE_TEST", "1");
+        Self {
+            process,
+            args: vec!["hopper".into()],
+        }
+    }
+    fn arg(&mut self, arg: impl AsRef<std::ffi::OsStr>) -> &mut Self {
+        self.args.push(arg.as_ref().to_str().unwrap().to_owned());
+        self
+    }
+    fn args<T, S>(&mut self, args: T) -> &mut Self
+    where
+        T: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        for arg in args {
+            self.arg(arg);
+        }
+        self
+    }
+    fn env(
+        &mut self,
+        key: impl AsRef<std::ffi::OsStr>,
+        value: impl AsRef<std::ffi::OsStr>,
+    ) -> &mut Self {
+        self.process.env(key, value);
+        self
+    }
+    fn env_remove(&mut self, key: impl AsRef<std::ffi::OsStr>) -> &mut Self {
+        self.process.env_remove(key);
+        self
+    }
+    fn output(&mut self) -> std::io::Result<std::process::Output> {
+        self.process.env(
+            "HOPPER_ENGINE_ARGS",
+            serde_json::to_string(&self.args).unwrap(),
+        );
+        self.process.output()
+    }
+}
+
+#[test]
+fn engine_test_driver() {
+    if std::env::var("HOPPER_ENGINE_TEST").as_deref() != Ok("1") {
+        return;
+    }
+    let args: Vec<String> =
+        serde_json::from_str(&std::env::var("HOPPER_ENGINE_ARGS").unwrap()).unwrap();
+    let cli = crate::cli::Cli::parse_from(args);
+    let code = match crate::run(&cli) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            crate::exit_code_for(&error)
+        }
+    };
+    std::process::exit(code);
+}
+
+struct Server {
+    dir: tempfile::TempDir,
+}
+
+impl Server {
+    fn new() -> Self {
+        Self {
+            dir: tempfile::tempdir().unwrap(),
+        }
+    }
+
+    fn root(&self) -> PathBuf {
+        self.dir.path().join("server")
+    }
+
+    fn cache(&self) -> PathBuf {
+        self.dir.path().join("cache")
+    }
+
+    /// Kept inside the test's own directory: installs record themselves in the data directory,
+    /// and the suite must never write to the real one.
+    fn data(&self) -> PathBuf {
+        self.dir.path().join("data")
+    }
+
+    /// Install a pack. Always `--mods-only`, so the suite never touches the network: the
+    /// loader, server jar and JVM all come from remote metadata.
+    fn install(&self, pack: &Path, extra: &[&str]) -> (String, String, i32) {
+        let mut args = vec![pack.to_str().unwrap(), "--mods-only"];
+        args.extend_from_slice(extra);
+        self.run(&args)
+    }
+
+    fn run(&self, args: &[&str]) -> (String, String, i32) {
+        let out = EngineCommand::new()
+            .args(args)
+            .arg("--dir")
+            .arg(self.root())
+            .env("HOPPER_CACHE_DIR", self.cache())
+            .env("HOPPER_DATA_DIR", self.data())
+            .output()
+            .expect("running hopper");
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.code().unwrap_or(-1),
+        )
+    }
+
+    fn write(&self, rel: &str, content: &str) {
+        let p = self.root().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, content).unwrap();
+    }
+
+    fn read(&self, rel: &str) -> Option<String> {
+        std::fs::read_to_string(self.root().join(rel)).ok()
+    }
+
+    fn exists(&self, rel: &str) -> bool {
+        self.root().join(rel).exists()
+    }
+}
+
+/// Build a `.mrpack` with no downloadable entries, so the tests need no network.
+fn build_pack(path: &Path, version: &str, overrides: &[(&str, &str)]) {
+    let index = serde_json::json!({
+        "formatVersion": 1,
+        "game": "minecraft",
+        "versionId": version,
+        "name": "Test Pack",
+        "files": [],
+        "dependencies": { "minecraft": "26.3", "fabric-loader": "0.17.2" },
+    });
+
+    let file = std::fs::File::create(path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default();
+    zip.start_file("modrinth.index.json", opts).unwrap();
+    zip.write_all(index.to_string().as_bytes()).unwrap();
+    for (name, content) in overrides {
+        zip.start_file(*name, opts).unwrap();
+        zip.write_all(content.as_bytes()).unwrap();
+    }
+    zip.finish().unwrap();
+}
+
+#[test]
+fn identical_files_still_commit_a_new_pack_version() {
+    let s = Server::new();
+    let v1 = s.dir.path().join("v1.mrpack");
+    let v2 = s.dir.path().join("v2.mrpack");
+    let files = [("overrides/config/a.toml", "setting=default\n")];
+    build_pack(&v1, "1.0.0", &files);
+    build_pack(&v2, "2.0.0", &files);
+    let (out, err, code) = s.install(&v1, &["--yes"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let (out, err, code) = s.install(&v2, &["--yes"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let lock = crate::read_lockfile(&s.root()).unwrap().unwrap();
+    assert_eq!(lock.pack.version_label.as_deref(), Some("2.0.0"));
+    assert_eq!(
+        s.read("config/a.toml").as_deref(),
+        Some("setting=default\n")
+    );
+}
+
+#[test]
+fn installs_a_pack_and_records_every_file_it_wrote() {
+    // The regression this file exists for: files installed but not tracked are invisible to
+    // every later update.
+    let s = Server::new();
+    let pack = s.dir.path().join("v1.mrpack");
+    build_pack(
+        &pack,
+        "1.0.0",
+        &[
+            ("overrides/config/a.toml", "setting=default\n"),
+            ("server-overrides/config/server.toml", "tick=20\n"),
+        ],
+    );
+
+    let (out, err, code) = s.install(&pack, &["--yes", "--eula"]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(s.exists("config/a.toml"));
+    assert!(s.exists("config/server.toml"));
+
+    let (status, _, _) = s.run(&["status"]);
+    assert!(
+        status.contains("2 managed by hopper"),
+        "every installed file must be tracked:\n{status}"
+    );
+}
+
+#[test]
+fn client_only_content_never_reaches_the_server() {
+    let s = Server::new();
+    let pack = s.dir.path().join("v1.mrpack");
+    build_pack(
+        &pack,
+        "1.0.0",
+        &[
+            ("overrides/config/a.toml", "x=1\n"),
+            // Never applied to a server, and there is no flag to change that.
+            ("client-overrides/options.txt", "fov:90\n"),
+            // Recognised as client-only from the path alone.
+            ("overrides/shaderpacks/pretty.zip", "shader\n"),
+            ("overrides/resourcepacks/pack.zip", "textures\n"),
+        ],
+    );
+
+    let (out, err, code) = s.install(&pack, &["--yes"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(s.exists("config/a.toml"));
+    assert!(!s.exists("options.txt"), "client-overrides must be dropped");
+    assert!(!s.exists("shaderpacks/pretty.zip"));
+    assert!(!s.exists("resourcepacks/pack.zip"));
+}
+
+#[test]
+fn an_update_preserves_operator_work_and_removes_what_the_pack_dropped() {
+    let s = Server::new();
+    let v1 = s.dir.path().join("v1.mrpack");
+    build_pack(
+        &v1,
+        "1.0.0",
+        &[
+            ("overrides/config/a.toml", "setting=default\n"),
+            ("overrides/config/gone.toml", "bye\n"),
+        ],
+    );
+    s.install(&v1, &["--yes", "--eula"]);
+
+    // The operator adds a mod and tunes a config.
+    s.write("mods/my-plugin.jar", "mine");
+    s.write("config/a.toml", "setting=tuned-by-me\n");
+
+    let v2 = s.dir.path().join("v2.mrpack");
+    build_pack(
+        &v2,
+        "2.0.0",
+        &[("overrides/config/a.toml", "setting=NEW\n")],
+    );
+    let (out, err, code) = s.install(&v2, &["--yes"]);
+    assert_eq!(code, 0, "{out}{err}");
+
+    assert_eq!(s.read("mods/my-plugin.jar").as_deref(), Some("mine"));
+    assert_eq!(
+        s.read("config/a.toml").as_deref(),
+        Some("setting=tuned-by-me\n"),
+        "their edit must win"
+    );
+    assert_eq!(
+        s.read("config/a.toml.new").as_deref(),
+        Some("setting=NEW\n"),
+        "and the pack's version should be there to compare"
+    );
+    assert!(crate::service::ensure_conflicts_resolved(&s.root()).is_err());
+    std::fs::remove_file(s.root().join("config/a.toml.new")).unwrap();
+    crate::service::ensure_conflicts_resolved(&s.root()).unwrap();
+    assert!(
+        !s.exists("config/gone.toml"),
+        "a file the pack dropped must actually go"
+    );
+    assert!(
+        out.contains("files added by you, untouched"),
+        "the safety promise should be restated:\n{out}"
+    );
+}
+
+#[test]
+fn a_disabled_mod_is_not_reinstalled_by_the_next_update() {
+    // `disable` renames rather than deletes precisely so an update respects it. That only
+    // works if the scan looks for the marker, which it did not at first: the mod came back.
+    let s = Server::new();
+    let pack = s.dir.path().join("v1.mrpack");
+    build_pack(&pack, "1.0.0", &[("overrides/config/a.toml", "x=1\n")]);
+    s.install(&pack, &["--yes", "--eula"]);
+
+    // Stand in for a mod by disabling a tracked file.
+    std::fs::rename(
+        s.root().join("config/a.toml"),
+        s.root().join("config/a.toml.disabled"),
+    )
+    .unwrap();
+
+    let (out, err, code) = s.install(&pack, &["--yes"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(
+        !s.exists("config/a.toml"),
+        "an update must not undo a deliberate disable:\n{out}"
+    );
+    assert!(s.exists("config/a.toml.disabled"));
+}
+
+#[test]
+fn a_second_identical_run_does_nothing() {
+    let s = Server::new();
+    let pack = s.dir.path().join("v1.mrpack");
+    build_pack(&pack, "1.0.0", &[("overrides/config/a.toml", "x=1\n")]);
+
+    s.install(&pack, &["--yes", "--eula"]);
+    let (out, _, code) = s.install(&pack, &["--yes"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("Already up to date"), "got:\n{out}");
+}
+
+#[test]
+fn dry_run_reports_pending_changes_without_applying_them() {
+    let s = Server::new();
+    let pack = s.dir.path().join("v1.mrpack");
+    build_pack(&pack, "1.0.0", &[("overrides/config/a.toml", "x=1\n")]);
+
+    let (out, _, code) = s.install(&pack, &["-n"]);
+    assert_eq!(
+        code, 10,
+        "pending changes exit 10 so cron can branch:\n{out}"
+    );
+    assert!(!s.exists("config/a.toml"), "--dry-run must not write");
+
+    // And nothing at all once it is settled.
+    s.install(&pack, &["--yes"]);
+    let (_, _, code) = s.install(&pack, &["-n"]);
+    assert_eq!(code, 0, "a settled directory exits 0");
+}
+
+#[test]
+fn a_bare_invocation_replays_the_recorded_source() {
+    let s = Server::new();
+    let pack = s.dir.path().join("v1.mrpack");
+    build_pack(&pack, "1.0.0", &[("overrides/config/a.toml", "x=1\n")]);
+    s.install(&pack, &["--yes", "--eula"]);
+
+    // No pack argument: it should remember what this directory was installed from, and
+    // that it was a mods-only install -- otherwise a loader and a JVM would appear.
+    let (out, err, code) = s.run(&["--yes"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(out.contains("Already up to date"), "got:\n{out}{err}");
+}
+
+#[test]
+fn an_empty_directory_with_no_argument_explains_what_to_do() {
+    let s = Server::new();
+    std::fs::create_dir_all(s.root()).unwrap();
+    let (_, err, code) = s.run(&[]);
+    assert_ne!(code, 0);
+    assert!(err.contains("hopper <pack>"), "got:\n{err}");
+}
+
+#[test]
+fn yes_does_not_accept_the_eula() {
+    // A "don't prompt me" flag must not agree to a licence agreement.
+    let s = Server::new();
+    let pack = s.dir.path().join("v1.mrpack");
+    build_pack(&pack, "1.0.0", &[("overrides/config/a.toml", "x=1\n")]);
+
+    let (out, _, _) = s.install(&pack, &["--yes"]);
+    assert!(
+        !s.exists("eula.txt"),
+        "--yes must not write eula.txt:\n{out}"
+    );
+    assert!(out.contains("EULA has not been accepted"), "got:\n{out}");
+
+    let (_, _, _) = s.install(&pack, &["--yes", "--eula"]);
+    assert!(s.read("eula.txt").unwrap().contains("eula=true"));
+}
+
+#[test]
+fn status_on_an_unmanaged_directory_says_so_plainly() {
+    let s = Server::new();
+    std::fs::create_dir_all(s.root()).unwrap();
+    let (out, _, code) = s.run(&["status"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("No pack is installed"), "got:\n{out}");
+}
+
+#[test]
+fn pointing_at_a_mod_page_names_the_mistake() {
+    let s = Server::new();
+    std::fs::create_dir_all(s.root()).unwrap();
+    let (_, err, code) = s.run(&["https://modrinth.com/mod/sodium"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("not a modpack"), "got:\n{err}");
+}
+
+#[test]
+fn a_hostile_pack_is_refused_with_a_security_exit_code() {
+    // Path traversal in an override entry, which would otherwise write outside the directory.
+    let s = Server::new();
+    let pack = s.dir.path().join("evil.mrpack");
+    build_pack(
+        &pack,
+        "1.0.0",
+        &[("overrides/../../../../tmp/hopper-pwned", "payload\n")],
+    );
+
+    let (_, err, code) = s.install(&pack, &["--yes"]);
+    assert_eq!(code, 5, "security refusals get their own exit code:\n{err}");
+    assert!(!Path::new("/tmp/hopper-pwned").exists());
+}
+
+#[test]
+fn a_curseforge_pack_without_an_api_key_says_how_to_get_one() {
+    let s = Server::new();
+    let out = EngineCommand::new()
+        .args(["cf:deceasedcraft", "--mods-only", "--yes", "--dir"])
+        .arg(s.root())
+        .env("HOPPER_CACHE_DIR", s.cache())
+        .env("HOPPER_DATA_DIR", s.data())
+        .env_remove("CURSEFORGE_API_KEY")
+        .output()
+        .expect("running hopper");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("CURSEFORGE_API_KEY"), "{err}");
+    assert!(err.contains("console.curseforge.com"), "{err}");
+    assert!(!s.exists("mods"), "nothing is written without a key");
+}
+
+#[test]
+fn the_curseforge_key_never_appears_in_output() {
+    // A key that cannot be sent as a header fails before any request goes out, which makes
+    // the error path testable offline. Its text must still not be echoed back.
+    let s = Server::new();
+    let secret = "do-not-print-me\nsecret";
+    let out = EngineCommand::new()
+        .args([
+            "cf:deceasedcraft",
+            "--mods-only",
+            "--yes",
+            "--cf-api-key",
+            secret,
+            "--dir",
+        ])
+        .arg(s.root())
+        .env("HOPPER_CACHE_DIR", s.cache())
+        .env("HOPPER_DATA_DIR", s.data())
+        .output()
+        .expect("running hopper");
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_ne!(out.status.code(), Some(0));
+    assert!(!all.contains("do-not-print-me"), "{all}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_directory_is_never_written_through() {
+    // An operator who points config/ at shared storage must not have hopper write into it,
+    // and nothing the pack ships may land outside the server directory.
+    let s = Server::new();
+    let elsewhere = s.dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::create_dir_all(s.root()).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, s.root().join("config")).unwrap();
+
+    let pack = s.dir.path().join("p.mrpack");
+    build_pack(
+        &pack,
+        "1.0.0",
+        &[
+            ("overrides/config/a.toml", "a = 1\n"),
+            ("overrides/kubejs/b.js", "b\n"),
+        ],
+    );
+    let (out, err, _) = s.install(&pack, &["--yes"]);
+
+    assert!(
+        std::fs::read_dir(&elsewhere).unwrap().next().is_none(),
+        "wrote through the symlink:\n{out}{err}"
+    );
+    assert!(
+        s.exists("kubejs/b.js"),
+        "unrelated files still install:\n{out}{err}"
+    );
+    assert!(out.contains("refused"), "the refusal is reported:\n{out}");
+}
+
+#[test]
+fn a_pack_cannot_install_access_lists() {
+    // An author's ops.json would make them an operator on every server installing the pack.
+    let s = Server::new();
+    let pack = s.dir.path().join("p.mrpack");
+    build_pack(
+        &pack,
+        "1.0.0",
+        &[
+            ("overrides/ops.json", "[{\"name\":\"author\",\"level\":4}]"),
+            ("server-overrides/whitelist.json", "[]"),
+            ("overrides/config/a.toml", "a = 1\n"),
+        ],
+    );
+    let (out, err, code) = s.install(&pack, &["--yes"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(!s.exists("ops.json"), "{out}");
+    assert!(!s.exists("whitelist.json"), "{out}");
+    assert!(s.exists("config/a.toml"));
+    assert!(
+        out.contains("access lists"),
+        "the refusal is reported:\n{out}"
+    );
+}
+
+#[test]
+fn force_exclude_applies_to_override_files_and_is_remembered() {
+    // Server packs ship every mod as an override; an exclusion that skipped those would do
+    // nothing. And a bare `hopper` from cron must not reinstall what the operator removed.
+    let s = Server::new();
+    let pack = s.dir.path().join("p.mrpack");
+    build_pack(
+        &pack,
+        "1.0.0",
+        &[
+            ("overrides/mods/keep.jar", "keep"),
+            ("overrides/mods/crashes-server.jar", "bad"),
+        ],
+    );
+    let (out, err, code) = s.install(&pack, &["--yes", "--force-exclude", "crashes-server"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(s.exists("mods/keep.jar"));
+    assert!(!s.exists("mods/crashes-server.jar"), "{out}");
+
+    let (out, err, code) = s.run(&["--mods-only", "--yes"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(
+        !s.exists("mods/crashes-server.jar"),
+        "reinstalled on update:\n{out}"
+    );
+    assert!(
+        out.contains("Remembered: --force-exclude crashes-server"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_version_given_twice_is_refused() {
+    let s = Server::new();
+    std::fs::create_dir_all(s.root()).unwrap();
+    let (_, err, code) = s.run(&["adrenaserver@1.0", "2.0", "--mods-only", "--yes"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("given twice"), "{err}");
+}
+
+#[test]
+fn a_second_server_gets_a_port_the_first_does_not_use() {
+    // Both installs share one data directory, the way two servers on one machine would.
+    let a = Server::new();
+    let pack = a.dir.path().join("p.mrpack");
+    build_pack(&pack, "1.0.0", &[("overrides/config/a.toml", "a\n")]);
+    let (out, err, code) = a.install(&pack, &["--yes"]);
+    assert_eq!(code, 0, "{out}{err}");
+
+    let b_root = a.dir.path().join("second");
+    let out = EngineCommand::new()
+        .args([pack.to_str().unwrap(), "--mods-only", "--yes", "--dir"])
+        .arg(&b_root)
+        .env("HOPPER_CACHE_DIR", a.cache())
+        .env("HOPPER_DATA_DIR", a.data())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+
+    let port = |dir: &Path| -> u16 {
+        std::fs::read_to_string(dir.join("server.properties"))
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("server-port="))
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    // Neither server is running, so only the record of the first keeps them apart.
+    assert_ne!(port(&a.root()), port(&b_root));
+    assert!(port(&a.root()) >= 25565 && port(&b_root) > 25565);
+}
+
+#[test]
+fn drift_alone_is_not_a_pack_change_for_the_update_timer() {
+    // The server deleting a file it regenerates must not make a scheduled update restart it.
+    let s = Server::new();
+    let pack = s.dir.path().join("p.mrpack");
+    build_pack(&pack, "1.0.0", &[("overrides/config/a.toml", "a = 1\n")]);
+    let (out, err, code) = s.install(&pack, &["--yes"]);
+    assert_eq!(code, 0, "{out}{err}");
+    std::fs::remove_file(s.root().join("config/a.toml")).unwrap();
+
+    // An ordinary dry run still reports it: the file would be restored.
+    let (_, _, code) = s.run(&["--mods-only", "--dry-run"]);
+    assert_eq!(code, 10);
+    // The timer's check does not.
+    let (out, err, code) = s.run(&["--mods-only", "--dry-run", "--pack-changes-only"]);
+    assert_eq!(code, 0, "{out}{err}");
+
+    // A real pack change still counts.
+    build_pack(&pack, "1.1.0", &[("overrides/config/a.toml", "a = 2\n")]);
+    let (_, _, code) = s.run(&["--mods-only", "--dry-run", "--pack-changes-only"]);
+    assert_eq!(code, 10);
+}
+
+#[test]
+fn dot_folders_in_a_pack_are_never_installed() {
+    let s = Server::new();
+    let pack = s.dir.path().join("p.mrpack");
+    build_pack(
+        &pack,
+        "1.0.0",
+        &[
+            ("overrides/.mixin.out/class/X.class", "x"),
+            ("overrides/mods/.connector/temp/y.jar", "y"),
+            ("overrides/config/a.toml", "a = 1\n"),
+        ],
+    );
+    let (out, err, code) = s.install(&pack, &["--yes"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(s.exists("config/a.toml"));
+    assert!(!s.exists(".mixin.out"), "{out}");
+    assert!(!s.exists("mods/.connector"), "{out}");
+}
+
+#[test]
+fn a_packs_default_server_properties_seeds_the_real_file_instead_of_being_installed() {
+    // Installed, it would let a mod replace server.properties with it on first start, wiping
+    // RCON and the chosen port. Seeding from it keeps the pack's intent without that.
+    let s = Server::new();
+    let pack = s.dir.path().join("p.mrpack");
+    build_pack(
+        &pack,
+        "1.0.0",
+        &[
+            (
+                "overrides/default-server.properties",
+                "allow-nether=false\nmax-tick-time=-1\n",
+            ),
+            ("overrides/config/a.toml", "a = 1\n"),
+        ],
+    );
+    let (out, err, code) = s.install(&pack, &["--yes"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(!s.exists("default-server.properties"), "{out}");
+    let props = s.read("server.properties").unwrap();
+    assert!(props.contains("allow-nether=false\n"), "{props}");
+    assert!(props.contains("max-tick-time=-1\n"), "{props}");
+    assert!(props.contains("server-port="), "{props}");
+}

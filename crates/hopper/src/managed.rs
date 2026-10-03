@@ -205,11 +205,22 @@ pub fn save(record: &Instance) -> Result<()> {
     Ok(())
 }
 pub fn list(scope: Scope) -> Result<Vec<Instance>> {
+    list_lenient(scope)?
+        .into_iter()
+        .map(|entry| entry.map_err(|(_, e)| e))
+        .collect()
+}
+
+/// Every record, with unreadable ones reported by name instead of failing the whole listing.
+/// A record, or the name of one that could not be read and why.
+pub type Listed = std::result::Result<Instance, (String, anyhow::Error)>;
+
+pub fn list_lenient(scope: Scope) -> Result<Vec<Listed>> {
     let root = config_root(scope)?;
     if !root.exists() {
         return Ok(vec![]);
     }
-    let mut instances = Vec::new();
+    let mut names = Vec::new();
     for entry in fs::read_dir(root)? {
         let path = entry?.path();
         if path.extension().is_some_and(|s| s == "json") {
@@ -218,11 +229,14 @@ pub fn list(scope: Scope) -> Result<Vec<Instance>> {
                 .context("missing instance name")?
                 .to_str()
                 .context("invalid instance name")?;
-            instances.push(load(scope, name)?);
+            names.push(name.to_owned());
         }
     }
-    instances.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(instances)
+    names.sort();
+    Ok(names
+        .into_iter()
+        .map(|name| load(scope, &name).map_err(|e| (name, e)))
+        .collect())
 }
 
 pub fn preflight(scope: Scope) -> Result<()> {
@@ -933,7 +947,17 @@ pub fn stop(record: &Instance) -> Result<()> {
     )
 }
 
-pub fn maintain(record: &Instance, update: bool, restart: bool) -> Result<i32> {
+/// A last question before maintenance goes ahead.
+pub type Confirm<'a> = &'a dyn Fn(&Instance) -> Result<bool>;
+
+/// `confirm` is asked once the update is staged and before players are warned, so what is
+/// confirmed is what will be applied; timers pass `None`.
+pub fn maintain(
+    record: &Instance,
+    update: bool,
+    restart: bool,
+    confirm: Option<Confirm>,
+) -> Result<i32> {
     ensure!(record.state == State::Ready, "instance is not ready");
     let _guard = operation_lock(record)?;
     let cancellation = cancellation(record)?;
@@ -975,6 +999,15 @@ pub fn maintain(record: &Instance, update: bool, restart: bool) -> Result<i32> {
     }
     if !changed && !restart {
         return Ok(0);
+    }
+    if let Some(confirm) = confirm.filter(|_| running) {
+        if !confirm(record)? {
+            println!(
+                "Staged, not applied. Run hopper update {} when ready.",
+                record.name
+            );
+            return Ok(crate::cli::exit::DECLINED);
+        }
     }
     let pid = property(record, "MainPID")?;
     let cancelled = || -> bool { fs::read(&cancellation).ok() != token };

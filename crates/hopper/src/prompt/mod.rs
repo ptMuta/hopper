@@ -36,6 +36,16 @@ struct Interaction {
 
 static INTERACTION: OnceLock<Interaction> = OnceLock::new();
 static FOOTER_SHOWN: AtomicBool = AtomicBool::new(false);
+/// Whether the prompt on screen is the first of this run, which alone explains the keys.
+static FOOTER_NOW: AtomicBool = AtomicBool::new(false);
+
+/// Called as each prompt opens.
+fn opening() {
+    FOOTER_NOW.store(
+        !FOOTER_SHOWN.swap(true, Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
+}
 
 fn truthy(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| !v.is_empty() && v != "0" && v != "false")
@@ -291,7 +301,7 @@ fn answered(key: &str, value: &str, tone: Tone) -> Line {
 }
 
 fn footer(indent: usize, multi: bool) -> Option<Line> {
-    if !multi && FOOTER_SHOWN.swap(true, Ordering::Relaxed) {
+    if !multi && !FOOTER_NOW.load(Ordering::Relaxed) {
         return None;
     }
     let s = sep();
@@ -323,6 +333,7 @@ trait Widget {
 }
 
 fn drive<W: Widget>(widget: &mut W) -> Result<W::Out> {
+    opening();
     let mut raw = sys::Raw::enter()?;
     let mut keys = sys::Keys::default();
     let mut screen = Screen::new();
@@ -844,7 +855,7 @@ impl Widget for YesNo<'_> {
     }
     fn render(&self, _: usize) -> Vec<Line> {
         let choices = if self.default { "Y/n" } else { "y/N" };
-        vec![header(self.key, &[], choices)]
+        vec![header(self.key, &[(choices.into(), Tone::Dim)], "")]
     }
     fn handle(&mut self, key: Key) -> Step<bool> {
         match key {
@@ -888,11 +899,11 @@ pub fn consent(question: &str) -> Result<bool> {
 
 /// A pause before something disruptive. Scripts proceed exactly as before this prompt
 /// existed; `-y` proceeds; a person at a terminal answers.
-pub fn proceed(question: &str) -> Result<bool> {
+pub fn proceed(question: &str, default: bool) -> Result<bool> {
     if !enabled() || assume_defaults() {
         return Ok(true);
     }
-    yes_no(question, false)
+    yes_no(question, default)
 }
 
 #[cfg(test)]
@@ -916,7 +927,6 @@ pub(crate) mod tests {
 
     #[test]
     fn select_filters_skips_disabled_and_goes_back() {
-        FOOTER_SHOWN.store(true, Ordering::Relaxed);
         let mut items = items(&["alpha", "beta", "gamma"]);
         items[1].disabled = Some("running".into());
         let mut list = List::new();

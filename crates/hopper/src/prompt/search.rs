@@ -13,6 +13,7 @@ use anyhow::Result;
 use super::sys::{self, Key};
 use super::{Back, Cancelled, Item, Line, List, Mode, Screen, Tone, header, indent};
 
+pub type Literal<'a, T> = Box<dyn Fn(&str) -> Option<Item<T>> + 'a>;
 pub type Fetch<'a, T> =
     Box<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<Vec<Item<T>>>> + 'a>> + 'a>;
 
@@ -23,7 +24,7 @@ pub struct Search<'a, T> {
     /// Remote lookup; the empty query asks for something worth showing before typing.
     pub fetch: Fetch<'a, T>,
     /// What typed text means on its own: a path, a URL, a literal slug.
-    pub literal: Box<dyn Fn(&str) -> Option<Item<T>> + 'a>,
+    pub literal: Literal<'a, T>,
 }
 
 const DEBOUNCE: Duration = Duration::from_millis(300);
@@ -112,6 +113,7 @@ pub async fn search<T: Clone>(search: Search<'_, T>) -> Result<T> {
     if super::mode() == Mode::Line {
         return line(&search).await;
     }
+    super::opening();
     let fd = tokio::io::unix::AsyncFd::new(0)?;
     let mut raw = sys::Raw::enter()?;
     let mut keys = sys::Keys::default();

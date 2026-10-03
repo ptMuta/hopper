@@ -31,6 +31,7 @@ mod managed;
 mod migration;
 mod prompt;
 mod render;
+mod resolve;
 mod runtime;
 mod selfupdate;
 mod service;

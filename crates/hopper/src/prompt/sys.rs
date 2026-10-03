@@ -53,10 +53,26 @@ fn install_hooks() {
         // off for SIGWINCH so a blocked poll(2) returns and the prompt redraws at the new size.
         unsafe {
             for (signal, handler, flags) in [
-                (libc::SIGTERM, on_fatal as usize, libc::SA_RESTART),
-                (libc::SIGHUP, on_fatal as usize, libc::SA_RESTART),
-                (libc::SIGQUIT, on_fatal as usize, libc::SA_RESTART),
-                (libc::SIGWINCH, on_resize as usize, 0),
+                (
+                    libc::SIGTERM,
+                    on_fatal as extern "C" fn(libc::c_int) as usize,
+                    libc::SA_RESTART,
+                ),
+                (
+                    libc::SIGHUP,
+                    on_fatal as extern "C" fn(libc::c_int) as usize,
+                    libc::SA_RESTART,
+                ),
+                (
+                    libc::SIGQUIT,
+                    on_fatal as extern "C" fn(libc::c_int) as usize,
+                    libc::SA_RESTART,
+                ),
+                (
+                    libc::SIGWINCH,
+                    on_resize as extern "C" fn(libc::c_int) as usize,
+                    0,
+                ),
             ] {
                 let mut action: libc::sigaction = std::mem::zeroed();
                 action.sa_sigaction = handler;

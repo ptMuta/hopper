@@ -219,7 +219,7 @@ pub enum Action {
     },
     /// Change the desired target or schedules without updating pack files.
     Configure {
-        name: String,
+        name: Option<String>,
         #[arg(long)]
         java_major: Option<u32>,
         #[arg(long, conflicts_with = "pack_version")]
@@ -237,56 +237,58 @@ pub enum Action {
     },
     List,
     Status {
-        name: String,
+        name: Option<String>,
     },
     Check {
-        name: String,
+        name: Option<String>,
     },
     Update {
-        name: String,
+        name: Option<String>,
     },
     Start {
-        name: String,
+        name: Option<String>,
         #[arg(long)]
         rcon_firewall_confirmed: bool,
     },
     Stop {
-        name: String,
+        name: Option<String>,
     },
     Restart {
-        name: String,
+        name: Option<String>,
     },
     Remove {
-        name: String,
+        name: Option<String>,
     },
     Repair {
-        name: String,
+        name: Option<String>,
     },
     Disable {
-        name: String,
-        file: String,
+        name: Option<String>,
+        /// Mod filenames, or unique parts of them.
+        files: Vec<String>,
     },
     Enable {
-        name: String,
-        file: String,
+        name: Option<String>,
+        /// Mod filenames, or unique parts of them.
+        files: Vec<String>,
     },
     Show {
-        name: String,
+        name: Option<String>,
         #[arg(long)]
         plain: bool,
     },
     Chat {
-        name: String,
+        name: Option<String>,
         #[arg(long)]
         nickname: Option<String>,
     },
     Console {
-        name: String,
+        name: Option<String>,
         #[arg(last = true)]
         command: Vec<String>,
     },
     Logs {
-        name: String,
+        name: Option<String>,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -427,7 +429,7 @@ pub async fn run(app: &App) -> Result<i32> {
             name,
             update,
             restart,
-        } => managed::maintain(&managed::load(app.scope, name)?, *update, *restart),
+        } => managed::maintain(&managed::load(app.scope, name)?, *update, *restart, None),
         Action::StartCheck { dir } => {
             ensure!(!managed::is_root(), "start checks must run unprivileged");
             crate::service::ensure_conflicts_resolved(dir)?;
@@ -506,11 +508,16 @@ async fn worker(app: &App, record: &Instance, operation: &str, args: &[String]) 
             crate::migration::repair(record)?;
             Ok(0)
         }
-        "disable" | "enable" => crate::toggle(
-            &record.server(),
-            args.first().context("missing filename")?,
-            operation == "disable",
-        ),
+        "disable" | "enable" => {
+            ensure!(!args.is_empty(), "missing filename");
+            for file in args {
+                let code = crate::toggle(&record.server(), file, operation == "disable")?;
+                if code != 0 {
+                    return Ok(code);
+                }
+            }
+            Ok(0)
+        }
         "show" => crate::show::run(&record.server(), args.first().is_some_and(|a| a == "plain")),
         "chat" => crate::chat::run(&record.server(), args.first().map(String::as_str)),
         "console" => crate::service::console(&record.server(), args),
@@ -999,29 +1006,59 @@ async fn create_instance(
 }
 
 fn instance_action(app: &App, action: &Action) -> Result<i32> {
+    use crate::resolve::{self, Need};
     use Action::*;
-    let name = match action {
-        Configure { name, .. }
-        | Status { name }
-        | Check { name }
-        | Update { name }
-        | Start { name, .. }
-        | Stop { name }
-        | Restart { name }
-        | Remove { name }
-        | Repair { name }
-        | Disable { name, .. }
-        | Enable { name, .. }
-        | Show { name, .. }
-        | Chat { name, .. }
-        | Console { name, .. }
-        | Logs { name, .. } => name,
+    let (name, need, command) = match action {
+        Configure { name, .. } => (name, Need::Change, "configure"),
+        Status { name } => (name, Need::Look, "status"),
+        Check { name } => (name, Need::Look, "check"),
+        Update { name } => (name, Need::Change, "update"),
+        Start { name, .. } => (name, Need::Stopped, "start"),
+        Stop { name } => (name, Need::Running, "stop"),
+        Restart { name } => (name, Need::Running, "restart"),
+        Remove { name } => (name, Need::Change, "remove"),
+        Repair { name } => (name, Need::Stopped, "repair"),
+        Disable { name, .. } => (name, Need::Change, "disable"),
+        Enable { name, .. } => (name, Need::Change, "enable"),
+        Show { name, .. } => (name, Need::Look, "show"),
+        Chat { name, .. } => (name, Need::Look, "chat"),
+        Console { name, .. } => (name, Need::Look, "console"),
+        Logs { name, .. } => (name, Need::Look, "logs"),
         _ => unreachable!(),
     };
-    let mut record = managed::load(app.scope, name)?;
+    let mut record = resolve::instance(app.scope, name.as_deref(), need, command)?;
+    let name = &record.name.clone();
+    let files = match action {
+        Disable { files, .. } | Enable { files, .. } => {
+            resolve::mod_files(&record, files, matches!(action, Disable { .. }))?
+        }
+        _ => vec![],
+    };
     if app.dry_run && !matches!(action, Status { .. } | Check { .. } | Logs { .. }) {
         println!("Would operate on {} ({:?})", name, app.scope);
         return Ok(10);
+    }
+    // A pause before interrupting players; scripts and -y go ahead as they always have.
+    let asking = crate::prompt::enabled() && !crate::prompt::assume_defaults();
+    let interrupt = |verb: &str| -> Result<bool> {
+        if !asking || !managed::property(&record, "ActiveState").is_ok_and(|s| resolve::running(&s))
+        {
+            return Ok(true);
+        }
+        crate::prompt::proceed(&resolve::interrupt(verb, &record), false)
+    };
+    match action {
+        Stop { .. } if !interrupt("Stop")? => return Ok(crate::cli::exit::DECLINED),
+        Restart { .. } if !interrupt("Restart")? => return Ok(crate::cli::exit::DECLINED),
+        Remove { .. }
+            if !crate::prompt::proceed(
+                &format!("Remove services for {name}? data is kept"),
+                false,
+            )? =>
+        {
+            return Ok(crate::cli::exit::DECLINED);
+        }
+        _ => {}
     }
     match action {
         Configure {
@@ -1106,8 +1143,20 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
             let _guard = managed::operation_lock(&record)?;
             managed::invoke(&record, "check", &[])
         }
-        Update { .. } => managed::maintain(&record, true, false),
-        Restart { .. } => managed::maintain(&record, false, true),
+        Update { .. } => {
+            let warn = record.warn;
+            let ask = move |record: &Instance| {
+                crate::prompt::proceed(
+                    &format!(
+                        "Apply now? {} is running; players get {warn}s warning",
+                        record.name
+                    ),
+                    true,
+                )
+            };
+            managed::maintain(&record, true, false, asking.then_some(&ask as _))
+        }
+        Restart { .. } => managed::maintain(&record, false, true, None),
         Start {
             rcon_firewall_confirmed,
             ..
@@ -1188,17 +1237,29 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
             crate::migration::finish_move(&record)?;
             Ok(0)
         }
-        Disable { file, .. } | Enable { file, .. } => {
+        Disable { .. } | Enable { .. } => {
             let _guard = managed::operation_lock(&record)?;
-            managed::invoke(
+            let code = managed::invoke(
                 &record,
                 if matches!(action, Disable { .. }) {
                     "disable"
                 } else {
                     "enable"
                 },
-                std::slice::from_ref(file),
-            )
+                &files,
+            )?;
+            if code == 0
+                && managed::property(&record, "ActiveState").is_ok_and(|s| resolve::running(&s))
+            {
+                println!(
+                    "{}",
+                    crate::style::Paint {
+                        on: crate::style::stdout()
+                    }
+                    .dim("takes effect on the next restart")
+                );
+            }
+            Ok(code)
         }
         Show { plain, .. } => {
             let args = if *plain { vec!["plain".into()] } else { vec![] };

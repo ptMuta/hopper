@@ -350,3 +350,11 @@ fn sigterm_and_ctrl_z_give_the_terminal_back() {
     };
     assert_eq!(after.c_lflag, cooked, "cooked again after SIGTERM");
 }
+
+#[test]
+fn configure_with_yes_does_not_open_the_editor() {
+    let root = tempfile::tempdir().unwrap();
+    record(root.path(), "alpha");
+    let pty = Pty::spawn(&["configure", "alpha", "-y"], root.path());
+    pty.finish();
+}

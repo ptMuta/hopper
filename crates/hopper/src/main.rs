@@ -250,11 +250,16 @@ fn toggle(root: &Path, name: &str, disable: bool) -> Result<i32> {
         .context("no pack is installed here")?;
 
     let suffix = ".disabled";
-    let matches: Vec<&LockedFile> = lock
-        .files
-        .iter()
-        .filter(|f| f.path.starts_with_dir("mods") && f.path.file_name().contains(name))
-        .collect();
+    let mods = || lock.files.iter().filter(|f| f.path.starts_with_dir("mods"));
+    // A whole file name is never ambiguous, even when it is part of another one's.
+    let exact: Vec<&LockedFile> = mods().filter(|f| f.path.file_name() == name).collect();
+    let matches: Vec<&LockedFile> = if exact.is_empty() {
+        mods()
+            .filter(|f| f.path.file_name().contains(name))
+            .collect()
+    } else {
+        exact
+    };
 
     let file = match matches.as_slice() {
         [] => bail!("no installed mod matches {name:?}"),

@@ -561,7 +561,7 @@ pub async fn run(app: &App) -> Result<i32> {
             restart: None,
             warn: None,
             rcon_firewall_confirmed: false,
-        } if crate::prompt::enabled() => {
+        } if crate::prompt::enabled() && !crate::prompt::assume_defaults() => {
             let record = crate::resolve::instance(
                 app.scope,
                 name.as_deref(),
@@ -1152,9 +1152,8 @@ async fn create_instance(
         record.scope,
         record.server().display()
     );
-    let start =
-        create.start || (crate::prompt::enabled() && crate::prompt::ask("Start now?", false)?);
-    if start {
+    // Asked, if at all, by the wizard before anything was downloaded.
+    if plan.start {
         drop(_guard);
         managed::start(&mut record, create.rcon_firewall_confirmed)?;
     }
@@ -1409,17 +1408,6 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
                 },
                 &files,
             )?;
-            if code == 0
-                && managed::property(&record, "ActiveState").is_ok_and(|s| resolve::running(&s))
-            {
-                println!(
-                    "{}",
-                    crate::style::Paint {
-                        on: crate::style::stdout()
-                    }
-                    .dim("takes effect on the next restart")
-                );
-            }
             Ok(code)
         }
         Show { plain, .. } => {

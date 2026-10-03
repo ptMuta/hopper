@@ -442,7 +442,7 @@ fn name_for(scope: Scope, seed: &str) -> String {
     }
     base.truncate(24);
     let base = base.trim_end_matches('-').to_owned();
-    let taken = |n: &str| managed::record_path(scope, n).map_or(true, |p| p.exists());
+    let taken = |n: &str| managed::record_path(scope, n).is_ok_and(|p| p.exists());
     if !taken(&base) {
         return base;
     }
@@ -594,7 +594,8 @@ async fn ask_release(
             prompt::busy("Version");
             let r = d.releases(p, pack).await;
             prompt::unbusy();
-            r?
+            // Offline: still answerable, with a typed pin instead of a list.
+            r.unwrap_or_default()
         }
         (_, Provider::Mrpack, _) => return Ok((None, None, 0)),
         _ => vec![],
@@ -622,8 +623,11 @@ async fn ask_release(
     if items.len() <= 1 && !always {
         // Nothing newer than stable: there is no choice to make.
         return Ok(match items.first() {
-            Some(_) => (None, None, 0),
-            None if testing.is_some() => (Some("testing".into()), None, 0),
+            Some(only) => (
+                (only.value != "stable").then(|| only.value.to_owned()),
+                None,
+                0,
+            ),
             None => bail!("this pack has no releases"),
         });
     }
@@ -739,13 +743,19 @@ pub async fn install(app: &App, create: &Create, from: Option<Option<&Path>>) ->
             }
             1 if !args.identified() => {
                 let initial = args.pack.clone().unwrap_or_default();
+                // Without the network and a provider, the provider is a question of its own.
+                let questions = if found.is_none() && args.provider.is_none() {
+                    2
+                } else {
+                    1
+                };
                 ask_pack(&found, args.provider, &initial).await.map(|pick| {
                     slug = pick.slug.clone();
                     args.provider = Some(pick.provider);
                     args.pack = pick.pack;
                     args.file = pick.file;
                     args.url = pick.url;
-                    1
+                    questions
                 })
             }
             2 if !onboarding
@@ -824,6 +834,9 @@ pub async fn install(app: &App, create: &Create, from: Option<Option<&Path>>) ->
                                 args.pack = create.source.pack.clone();
                                 args.file = create.source.file.clone();
                                 args.url = create.source.url.clone();
+                                // A release decided for the old pack does not carry over.
+                                args.channel = create.source.channel.clone();
+                                args.pack_version = create.source.pack_version.clone();
                             }
                             2 => {
                                 args.channel = None;

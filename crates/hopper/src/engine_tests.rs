@@ -664,3 +664,22 @@ fn a_packs_default_server_properties_seeds_the_real_file_instead_of_being_instal
     assert!(props.contains("max-tick-time=-1\n"), "{props}");
     assert!(props.contains("server-port="), "{props}");
 }
+
+#[test]
+fn a_whole_mod_name_is_not_ambiguous() {
+    // Picked from a list, a name arrives whole; another mod containing it must not block it.
+    let s = Server::new();
+    let pack = s.dir.path().join("v1.mrpack");
+    build_pack(
+        &pack,
+        "1.0.0",
+        &[
+            ("overrides/mods/sodium.jar", "a"),
+            ("overrides/mods/reeses-sodium.jar", "b"),
+        ],
+    );
+    s.install(&pack, &["--yes", "--eula"]);
+    assert_eq!(crate::toggle(&s.root(), "sodium.jar", true).unwrap(), 0);
+    assert!(s.exists("mods/sodium.jar.disabled"));
+    assert!(s.exists("mods/reeses-sodium.jar"));
+}

@@ -68,6 +68,12 @@ fn install_hooks() {
                     on_fatal as extern "C" fn(libc::c_int) as usize,
                     libc::SA_RESTART,
                 ),
+                // Raw mode turns Ctrl-C into a key, but `kill -INT` still arrives as a signal.
+                (
+                    libc::SIGINT,
+                    on_fatal as extern "C" fn(libc::c_int) as usize,
+                    libc::SA_RESTART,
+                ),
                 (
                     libc::SIGWINCH,
                     on_resize as extern "C" fn(libc::c_int) as usize,
@@ -110,11 +116,13 @@ impl Raw {
             libc::cfmakeraw(&mut raw);
             // Keep output post-processing so "\n" still returns the carriage.
             raw.c_oflag |= libc::OPOST;
+            // Marked first: a signal landing mid-switch must still restore.
+            ACTIVE.store(true, Ordering::SeqCst);
             if libc::tcsetattr(STDIN, libc::TCSADRAIN, &raw) != 0 {
+                ACTIVE.store(false, Ordering::SeqCst);
                 return Err(std::io::Error::last_os_error().into());
             }
         }
-        ACTIVE.store(true, Ordering::SeqCst);
         let mut err = std::io::stderr();
         let _ = err.write_all(b"\x1b[?25l");
         let _ = err.flush();

@@ -161,7 +161,9 @@ fn verify_archive(path: &Path, expected: &Manifest) -> Result<()> {
         RelPath::parse(&name)?;
         let mode = entry.header().mode()? & 0o7777;
         let kind = entry.header().entry_type();
-        let (digest, size, link) = if kind.is_file() {
+        // tar's reader expands GNU sparse holes to zero bytes. Hash the logical
+        // contents exactly as manifest() hashes the source, not the stored extents.
+        let (digest, size, link) = if kind.is_file() || kind.is_gnu_sparse() {
             let mut hasher = hopper_core::MultiHasher::new();
             let mut size = 0u64;
             let mut buffer = [0u8; 65536];
@@ -186,7 +188,10 @@ fn verify_archive(path: &Path, expected: &Manifest) -> Result<()> {
                 ),
             )
         } else {
-            ensure!(kind.is_dir(), "unexpected backup entry type");
+            ensure!(
+                kind.is_dir(),
+                "unexpected backup entry type {kind:?} at {name}"
+            );
             (None, 0, None)
         };
         ensure!(
@@ -607,6 +612,127 @@ pub fn repair(record: &Instance) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sparse_world_backup_verifies_and_restores_logical_contents() {
+        use clap::Parser;
+        use hopper_core::model::{
+            LOCK_VERSION, LoaderKind, Lockfile, MinecraftVersion,
+            lock::{PackRecord, PolicyRecord, ServerRecord},
+        };
+        use std::io::{Seek, SeekFrom, Write};
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("original");
+        fs::create_dir_all(source.join("World/region")).unwrap();
+        let region = source.join("World/region/r.0.0.mca");
+        let mut file = File::create(&region).unwrap();
+        // More than four extents exercises GNU's extended sparse headers too.
+        for n in 0..8 {
+            file.seek(SeekFrom::Start(n * 128 * 1024)).unwrap();
+            file.write_all(&[n as u8 + 1; 4096]).unwrap();
+        }
+        file.set_len(1024 * 1024).unwrap();
+        file.sync_all().unwrap();
+        let empty = File::create(source.join("World/region/r.1.0.mca")).unwrap();
+        empty.set_len(1024 * 1024).unwrap();
+        empty.sync_all().unwrap();
+
+        let archive_path = temp.path().join("backup.tar.gz");
+        let expected = backup(&source, &archive_path).unwrap();
+        let mut archive = tar::Archive::new(GzDecoder::new(File::open(&archive_path).unwrap()));
+        assert!(
+            archive.entries().unwrap().any(|entry| entry
+                .unwrap()
+                .header()
+                .entry_type()
+                .is_gnu_sparse())
+        );
+        verify_archive(&archive_path, &expected).unwrap();
+        let mut corrupt = expected.clone();
+        corrupt.get_mut("World/region/r.0.0.mca").unwrap().size += 1;
+        assert!(verify_archive(&archive_path, &corrupt).is_err());
+        let mut corrupt = expected.clone();
+        corrupt.get_mut("World/region/r.0.0.mca").unwrap().digest =
+            expected["World/region/r.1.0.mca"].digest.clone();
+        assert!(verify_archive(&archive_path, &corrupt).is_err());
+
+        let app = crate::interface::App::try_parse_from([
+            "hopper",
+            "install",
+            "sparse-world",
+            "--provider",
+            "gtnh",
+        ])
+        .unwrap();
+        let Some(crate::interface::Action::Install(create)) = app.command else {
+            panic!()
+        };
+        let mut record =
+            Instance::new(Scope::User, "sparse-world", create.source, create.runtime).unwrap();
+        record.root = temp.path().join("managed");
+        record.backup = Some(archive_path);
+        fs::create_dir_all(record.server().join(".hopper")).unwrap();
+        let lock = Lockfile {
+            lock_version: LOCK_VERSION,
+            generator: "hopper test".into(),
+            updated_at: "2026-10-03T00:00:00Z".into(),
+            server: ServerRecord {
+                minecraft: MinecraftVersion::new("1.7.10"),
+                loader: LoaderKind::Forge,
+                loader_version: "10.13.4.1614".into(),
+                java_major: 25,
+                start_script: None,
+            },
+            pack: PackRecord::default(),
+            policy: PolicyRecord::default(),
+            files: vec![],
+            skipped: vec![],
+            unknown: BTreeMap::new(),
+        };
+        fs::write(
+            record.server().join(".hopper/lock.json"),
+            lock.to_json().unwrap(),
+        )
+        .unwrap();
+        restore(&record).unwrap();
+        verify_destination(&record, &expected).unwrap();
+        assert_eq!(
+            hfs::hash_file(&region).unwrap(),
+            hfs::hash_file(&record.server().join("World/region/r.0.0.mca")).unwrap()
+        );
+        assert_eq!(
+            fs::read(record.server().join("World/region/r.1.0.mca")).unwrap(),
+            vec![0; 1024 * 1024]
+        );
+        assert!(region.exists(), "verification must not remove the original");
+    }
+
+    #[test]
+    fn unsupported_backup_entries_still_fail_with_path_and_type() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("unsupported.tar.gz");
+        let mut builder = tar::Builder::new(GzEncoder::new(
+            File::create(&path).unwrap(),
+            Compression::default(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Fifo);
+        header.set_mode(0o600);
+        header.set_size(0);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "world.fifo", std::io::empty())
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+        let error = verify_archive(&path, &Manifest::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Fifo") && error.contains("world.fifo"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn backup_round_trip_includes_edited_configs_and_capital_world() {
         let temp = tempfile::tempdir().unwrap();

@@ -51,20 +51,24 @@ fn truthy(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| !v.is_empty() && v != "0" && v != "false")
 }
 
-/// Decide once whether anyone can be asked. Unset means `Off`: a path that forgets to call
-/// this can never prompt.
-pub fn init(no_input: bool, json: bool, yes: bool, hidden: bool) {
+/// Whether interaction is available, shared by prompts and sudo elevation.
+pub fn can_ask(no_input: bool, json: bool, hidden: bool) -> bool {
     let terminals = std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
         && std::io::stderr().is_terminal();
-    let mode = if no_input
-        || json
-        || hidden
-        || !terminals
-        || truthy("HOPPER_NO_INPUT")
-        || truthy("CI")
-        || !sys::foreground()
-    {
+    !no_input
+        && !json
+        && !hidden
+        && terminals
+        && !truthy("HOPPER_NO_INPUT")
+        && !truthy("CI")
+        && sys::foreground()
+}
+
+/// Decide once whether anyone can be asked. Unset means `Off`: a path that forgets to call
+/// this can never prompt.
+pub fn init(no_input: bool, json: bool, yes: bool, hidden: bool) {
+    let mode = if !can_ask(no_input, json, hidden) {
         Mode::Off
     } else if std::env::var("TERM").is_ok_and(|t| t == "dumb")
         || truthy("HOPPER_ACCESSIBLE")

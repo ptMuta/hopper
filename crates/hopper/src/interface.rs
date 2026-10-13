@@ -918,13 +918,7 @@ pub async fn select_source(record: &Instance) -> Result<hopper_core::source::Sou
 }
 
 fn cf_client() -> Result<hopper_core::net::HttpClient> {
-    let key = crate::curseforge::api_key(None).context("CURSEFORGE_API_KEY is required")?;
-    Ok(hopper_core::net::HttpClient::with_secret_header(
-        &crate::user_agent(),
-        hopper_core::net::HostAllowlist::curseforge_api(),
-        "x-api-key",
-        &key,
-    )?)
+    crate::curseforge::client(crate::curseforge::api_key(None), &crate::user_agent())
 }
 
 async fn discovery(
@@ -1036,6 +1030,7 @@ async fn create_instance(
         "--java-major selects a GTNH distribution; other providers use their declared Java requirement or --java PATH"
     );
     managed::validate_name(&plan.name)?;
+    managed::check_credentials(app.scope, &plan.name, plan.source.provider)?;
     managed::preflight(app.scope)?;
     if managed::record_path(app.scope, &plan.name)?.exists() {
         let mut existing = managed::load(app.scope, &plan.name)?;
@@ -1230,6 +1225,7 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
             rcon_firewall_confirmed,
             ..
         } => {
+            managed::check_credentials(record.scope, &record.name, record.source.provider)?;
             let _guard = managed::operation_lock(&record)?;
             if let Some(major) = java_major {
                 ensure!(
@@ -1263,6 +1259,7 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
             if *rcon_firewall_confirmed {
                 record.firewall_port = managed::rcon_port(&record).ok();
             }
+            managed::store_credentials(&record)?;
             managed::save(&record)?;
             managed::install_units(&record)?;
             println!(
@@ -1300,6 +1297,7 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
             }
         }
         Check { .. } => {
+            managed::check_credentials(record.scope, &record.name, record.source.provider)?;
             let _guard = managed::operation_lock(&record)?;
             managed::invoke(&record, "check", &[])
         }
@@ -1333,6 +1331,7 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
             Ok(0)
         }
         Repair { .. } => {
+            managed::check_credentials(record.scope, &record.name, record.source.provider)?;
             let _guard = managed::operation_lock(&record)?;
             ensure!(
                 managed::property(&record, "ActiveState").or_else(|e| {
@@ -1344,6 +1343,7 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
                 })? == "inactive",
                 "stop the server before repair"
             );
+            managed::store_credentials(&record)?;
             if record.scope == Scope::System {
                 managed::refresh_system_helper()?;
             }

@@ -172,6 +172,32 @@ fn plain(args: &[&str], root: &Path) -> Output {
 }
 
 #[test]
+fn explicit_curseforge_without_key_fails_before_interactive_questions() {
+    let root = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["search", "--provider", "curseforge"],
+        vec!["versions", "--provider", "curseforge"],
+        vec![
+            "install",
+            "atm10",
+            "--provider",
+            "curseforge",
+            "--pack",
+            "all-the-mods-10",
+        ],
+    ] {
+        let mut cmd = command(&args, root.path());
+        cmd.env_remove("CURSEFORGE_API_KEY")
+            .env_remove("CREDENTIALS_DIRECTORY")
+            .env_remove("HOPPER_CREDENTIAL_FILE");
+        let mut pty = Pty::spawn_with(cmd);
+        pty.wait_for("CurseForge requires CURSEFORGE_API_KEY");
+        assert_ne!(pty.finish(), 0);
+    }
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn picks_an_instance_with_arrow_keys() {
     let root = tempfile::tempdir().unwrap();
     record(root.path(), "alpha");

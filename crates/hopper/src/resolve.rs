@@ -483,8 +483,18 @@ async fn ask_pack(
     found: &Option<Discovery>,
     provider: Option<Provider>,
     initial: &str,
+    saved_key_available: bool,
 ) -> Result<Pick> {
+    if provider == Some(Provider::Curseforge)
+        && !saved_key_available
+        && !found.as_ref().is_some_and(Discovery::has_curseforge)
+    {
+        crate::curseforge::require_api_key(crate::curseforge::api_key(None))?;
+    }
     let typed = |provider: Provider| -> Result<Pick> {
+        if provider == Provider::Curseforge && !saved_key_available {
+            crate::curseforge::require_api_key(crate::curseforge::api_key(None))?;
+        }
         Ok(match provider {
             Provider::Gtnh => Pick::gtnh(),
             Provider::Mrpack => {
@@ -582,6 +592,9 @@ async fn ask_release(
     pack: Option<&str>,
     always: bool,
 ) -> Result<(Option<String>, Option<String>, usize)> {
+    if provider == Provider::Curseforge && found.as_ref().is_some_and(|d| !d.has_curseforge()) {
+        bail!(crate::curseforge::MISSING_KEY);
+    }
     let sep = prompt::sep();
     let releases = match (found, provider, pack) {
         (Some(d), Provider::Gtnh, _) => {
@@ -713,11 +726,20 @@ pub async fn install(app: &App, create: &Create, from: Option<Option<&Path>>) ->
         });
     }
 
+    let key = if create.source.provider == Some(Provider::Curseforge) {
+        Some(match create.name.as_deref() {
+            Some(name) => managed::api_key_for_instance(app.scope, name)?,
+            None => crate::curseforge::require_api_key(crate::curseforge::api_key(None))?,
+        })
+    } else {
+        crate::curseforge::api_key(None)
+    };
+    let saved_key_available = create.source.provider == Some(Provider::Curseforge) && key.is_some();
     // Lookups run as the invoking user; root never touches the registries.
     let found = if managed::is_root() {
         None
     } else {
-        Discovery::new().ok()
+        Discovery::with_curseforge_key(key).ok()
     };
     let mut args = create.source.clone();
     let mut name = create.name.clone();
@@ -749,14 +771,16 @@ pub async fn install(app: &App, create: &Create, from: Option<Option<&Path>>) ->
                 } else {
                     1
                 };
-                ask_pack(&found, args.provider, &initial).await.map(|pick| {
-                    slug = pick.slug.clone();
-                    args.provider = Some(pick.provider);
-                    args.pack = pick.pack;
-                    args.file = pick.file;
-                    args.url = pick.url;
-                    questions
-                })
+                ask_pack(&found, args.provider, &initial, saved_key_available)
+                    .await
+                    .map(|pick| {
+                        slug = pick.slug.clone();
+                        args.provider = Some(pick.provider);
+                        args.pack = pick.pack;
+                        args.file = pick.file;
+                        args.url = pick.url;
+                        questions
+                    })
             }
             2 if !onboarding
                 && args.channel.is_none()
@@ -856,7 +880,7 @@ pub async fn install(app: &App, create: &Create, from: Option<Option<&Path>>) ->
     }
     let provider = args.provider.context("no provider chosen")?;
     if provider == Provider::Curseforge && found.as_ref().is_some_and(|d| !d.has_curseforge()) {
-        bail!("CurseForge needs an API key\nhelp: set CURSEFORGE_API_KEY, see hopper providers");
+        bail!(crate::curseforge::MISSING_KEY);
     }
     Ok(Plan {
         name: name.context("no name chosen")?,
@@ -870,6 +894,9 @@ pub async fn install(app: &App, create: &Create, from: Option<Option<&Path>>) ->
 
 /// The source for `versions`: complete, or asked for.
 pub async fn versions_source(args: &SourceArgs) -> Result<Source> {
+    if args.provider == Some(Provider::Curseforge) {
+        crate::curseforge::require_api_key(crate::curseforge::api_key(None))?;
+    }
     if args.identified() {
         return Ok(args.source(args.provider.expect("identified")));
     }
@@ -881,7 +908,7 @@ pub async fn versions_source(args: &SourceArgs) -> Result<Source> {
         .into());
     }
     anyhow::ensure!(!managed::is_root(), "run provider discovery without sudo");
-    let pick = ask_pack(&Discovery::new().ok(), args.provider, "").await?;
+    let pick = ask_pack(&Discovery::new().ok(), args.provider, "", false).await?;
     let mut args = args.clone();
     args.provider = Some(pick.provider);
     args.pack = pick.pack;
@@ -892,6 +919,9 @@ pub async fn versions_source(args: &SourceArgs) -> Result<Source> {
 
 /// `search` at a terminal: pick a pack and get the command that installs it.
 pub async fn search(provider: Option<Provider>, query: Option<&str>) -> Result<Option<String>> {
+    if provider == Some(Provider::Curseforge) {
+        crate::curseforge::require_api_key(crate::curseforge::api_key(None))?;
+    }
     if let (Some(_), Some(_)) = (provider, query) {
         return Ok(None);
     }
@@ -910,7 +940,7 @@ pub async fn search(provider: Option<Provider>, query: Option<&str>) -> Result<O
         .into());
     }
     anyhow::ensure!(!managed::is_root(), "run provider discovery without sudo");
-    let pick = ask_pack(&Discovery::new().ok(), provider, query.unwrap_or("")).await?;
+    let pick = ask_pack(&Discovery::new().ok(), provider, query.unwrap_or(""), false).await?;
     let name = name_for(Scope::User, &pick.slug);
     let mut line = vec![
         "hopper".to_owned(),
@@ -1076,10 +1106,15 @@ fn parse_warn(text: &str) -> Result<u32> {
 
 /// One list of the current settings; Enter edits one, `save` ends. `None` if nothing changed.
 pub async fn configure(record: &Instance) -> Result<Settings> {
+    let key = if record.source.provider == Provider::Curseforge {
+        Some(managed::instance_api_key(record)?)
+    } else {
+        crate::curseforge::api_key(None)
+    };
     let found = if managed::is_root() {
         None
     } else {
-        Discovery::new().ok()
+        Discovery::with_curseforge_key(key).ok()
     };
     let gtnh = record.source.provider == Provider::Gtnh;
     let mut target = (

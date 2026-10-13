@@ -331,6 +331,7 @@ pub fn refresh_system_helper() -> Result<()> {
 }
 
 pub fn resume_prepare(record: &mut Instance) -> Result<()> {
+    check_credentials(record.scope, &record.name, record.source.provider)?;
     ensure!(
         record.state == State::Pending && !record.storage_ready,
         "storage is already initialized"
@@ -474,6 +475,11 @@ fn executable(record: &Instance) -> Result<PathBuf> {
 
 /// Execute network/archive/JVM work as the owner, with no shell or root execution.
 fn worker_command(record: &Instance, operation: &str, args: &[String]) -> Result<Command> {
+    if matches!(operation, "install" | "check" | "stage") {
+        // systemd-run does not inherit the coordinator's environment. Refresh the
+        // private credential before handing it to the worker via LoadCredential.
+        store_credentials(record)?;
+    }
     let executable = executable(record)?;
     let mut cmd = if record.scope == Scope::System {
         ensure!(is_root(), "system operations require sudo --scope system");
@@ -694,28 +700,74 @@ fn working_directory(path: &Path) -> Result<String> {
 fn credential_path(record: &Instance) -> Result<PathBuf> {
     Ok(config_root(record.scope)?.join(format!("{}.curseforge-key", record.name)))
 }
-fn store_credentials(record: &Instance) -> Result<()> {
-    if record.source.provider != crate::interface::Provider::Curseforge
-        || (record.update == "off" && record.scope == Scope::User)
-    {
+pub fn check_credentials(
+    scope: Scope,
+    name: &str,
+    provider: crate::interface::Provider,
+) -> Result<()> {
+    if provider == crate::interface::Provider::Curseforge {
+        api_key_for_instance(scope, name)?;
+    }
+    Ok(())
+}
+
+fn read_credential(path: &Path, scope: Scope, supplied: Option<String>) -> Result<String> {
+    let supplied = supplied.filter(|k| !k.trim().is_empty());
+    // Validate an existing destination even when replacing its contents.
+    let stored = match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            ensure!(
+                meta.is_file() && !meta.file_type().is_symlink() && meta.mode() & 0o077 == 0,
+                "credential must be a private regular file"
+            );
+            if scope == Scope::System {
+                trusted(path, false)?;
+            }
+            if supplied.is_none() {
+                Some(fs::read_to_string(path).context("reading saved CurseForge credential")?)
+            } else {
+                None
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).context("reading saved CurseForge credential"),
+    };
+    crate::curseforge::require_api_key(supplied.or(stored))
+}
+
+pub fn instance_api_key(record: &Instance) -> Result<String> {
+    api_key_for_instance(record.scope, &record.name)
+}
+
+pub fn api_key_for_instance(scope: Scope, name: &str) -> Result<String> {
+    validate_name(name)?;
+    read_credential(
+        &config_root(scope)?.join(format!("{name}.curseforge-key")),
+        scope,
+        crate::curseforge::api_key(None),
+    )
+}
+
+pub fn store_credentials(record: &Instance) -> Result<()> {
+    if record.source.provider != crate::interface::Provider::Curseforge {
         return Ok(());
     }
     let path = credential_path(record)?;
-    if path.exists() {
-        let meta = fs::symlink_metadata(&path)?;
-        ensure!(
-            meta.is_file() && !meta.file_type().is_symlink() && meta.mode() & 0o077 == 0,
-            "credential must be a private regular file"
-        );
-        if record.scope == Scope::System {
-            trusted(&path, false)?;
-        }
+    let key = read_credential(&path, record.scope, crate::curseforge::api_key(None))?;
+    if record.update == "off" && record.scope == Scope::User && !path.exists() {
         return Ok(());
     }
-    let key = crate::curseforge::api_key(None)
-        .context("scheduled CurseForge updates require CURSEFORGE_API_KEY")?;
-    ensure!(!key.contains(['\n', '\r']), "invalid API key");
-    hfs::write_private_atomic(&path, key.as_bytes())?;
+    write_credential(&path, record.scope, &key)
+}
+
+fn write_credential(path: &Path, scope: Scope, key: &str) -> Result<()> {
+    if fs::read(path).ok().as_deref() == Some(key.as_bytes()) {
+        return Ok(());
+    }
+    if scope == Scope::System {
+        trusted_dir(path.parent().context("missing credential parent")?)?;
+    }
+    hfs::write_private_atomic(path, key.as_bytes())?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
@@ -959,6 +1011,9 @@ pub fn maintain(
     confirm: Option<Confirm>,
 ) -> Result<i32> {
     ensure!(record.state == State::Ready, "instance is not ready");
+    if update {
+        check_credentials(record.scope, &record.name, record.source.provider)?;
+    }
     let _guard = operation_lock(record)?;
     let cancellation = cancellation(record)?;
     let token = fs::read(&cancellation).ok();
@@ -1153,6 +1208,65 @@ pub fn logs(record: &Instance, args: &[String]) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn supplied_key_replaces_saved_key_and_is_available_without_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("curseforge-key");
+        hfs::write_private_atomic(&path, b"old-key").unwrap();
+        let key = read_credential(&path, Scope::User, Some("new-key".into())).unwrap();
+        assert_eq!(key, "new-key");
+        write_credential(&path, Scope::User, &key).unwrap();
+        assert_eq!(
+            read_credential(&path, Scope::User, None).unwrap(),
+            "new-key"
+        );
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        fs::write(&path, [0xff]).unwrap();
+        assert_eq!(
+            read_credential(&path, Scope::User, Some("replacement-key".into())).unwrap(),
+            "replacement-key"
+        );
+    }
+
+    #[test]
+    fn missing_empty_and_malformed_credentials_fail_without_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("curseforge-key");
+        for supplied in [None, Some("".into()), Some(" \n".into())] {
+            let error = read_credential(&path, Scope::User, supplied).unwrap_err();
+            assert!(error.to_string().contains("CURSEFORGE_API_KEY"));
+            assert!(!path.exists());
+        }
+        hfs::write_private_atomic(&path, b" \n").unwrap();
+        assert!(read_credential(&path, Scope::User, None).is_err());
+        hfs::write_private_atomic(&path, b"saved-key").unwrap();
+        assert_eq!(
+            read_credential(&path, Scope::User, Some(" ".into())).unwrap(),
+            "saved-key"
+        );
+        let error = read_credential(&path, Scope::User, Some("secret\ninjection".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid CurseForge API key"));
+        assert!(!error.contains("secret"));
+        assert_eq!(fs::read(&path).unwrap(), b"saved-key");
+    }
+
+    #[test]
+    fn credential_rotation_rejects_unsafe_existing_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("curseforge-key");
+        let target = temp.path().join("target");
+        hfs::write_private_atomic(&target, b"saved-key").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(read_credential(&path, Scope::User, Some("new-key".into())).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"saved-key").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_credential(&path, Scope::User, Some("new-key".into())).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"saved-key");
+    }
+
     fn record(scope: Scope) -> Instance {
         let source = crate::interface::App::try_parse_from([
             "hopper",

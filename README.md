@@ -19,6 +19,13 @@ starting it. The first `start` enables the service and its configured timers.
 Use `--start` to start immediately. EULA acceptance requires `--eula` or an
 interactive confirmation; `--yes` does not accept the EULA.
 
+Use `--scope system` to manage a system instance. Hopper automatically runs its
+coordinator through sudo, preserving `CURSEFORGE_API_KEY`; root skips sudo.
+Elevation happens before prompts or installation changes. In scripts, CI, or with
+`--no-input`/`--json`, sudo cannot prompt and fails immediately if authorization is
+unavailable. Install sudo or run as root if sudo is missing. Pack workers always
+run as the dedicated instance user.
+
 ## At a terminal and in scripts
 
 At a terminal, anything left out is asked: `hopper install` searches Modrinth and
@@ -101,6 +108,14 @@ downloads. Scheduled updates save it privately; system workers receive a systemd
 credential, not a public unit environment variable. Packs without a server pack require
 explicit `--allow-client-pack`, or a yes at the terminal, which is kept for later updates;
 blocked downloads can be skipped with `--skip-blocked`.
+
+Exporting a new key before install, repair, check, update, or configure refreshes the
+saved credential used by workers and scheduled updates. For system operations, use
+`sudo --preserve-env=CURSEFORGE_API_KEY -- hopper COMMAND NAME --scope system`.
+Commands that need CurseForge access fail before changing the installation when neither
+an exported key nor a saved instance credential is available. Search and versions use
+the exported key; local operations such as status, start, stop, and restart do not
+require CurseForge access.
 
 ## GregTech: New Horizons
 

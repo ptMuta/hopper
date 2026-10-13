@@ -141,17 +141,13 @@ const LOADERS: [&str; 4] = ["fabric", "neoforge", "forge", "quilt"];
 
 impl Discovery {
     pub fn new() -> Result<Self> {
+        Self::with_curseforge_key(crate::curseforge::api_key(None))
+    }
+
+    pub fn with_curseforge_key(key: Option<String>) -> Result<Self> {
         let agent = crate::user_agent();
-        let curseforge = crate::curseforge::api_key(None).and_then(|key| {
-            HttpClient::with_secret_header(
-                &agent,
-                HostAllowlist::curseforge_api(),
-                "x-api-key",
-                &key,
-            )
-            .ok()
-            .map(once)
-        });
+        let curseforge =
+            key.and_then(|key| crate::curseforge::client(Some(key), &agent).ok().map(once));
         Ok(Self {
             modrinth: once(HttpClient::new(&agent, HostAllowlist::api())?),
             curseforge,
@@ -241,7 +237,12 @@ impl Discovery {
     pub async fn search(&self, provider: Option<Provider>, query: &str) -> Result<Vec<Hit>> {
         match provider {
             Some(Provider::Modrinth) => self.modrinth(query).await,
-            Some(Provider::Curseforge) => self.curseforge(query).await,
+            Some(Provider::Curseforge) => {
+                self.curseforge
+                    .as_ref()
+                    .context(crate::curseforge::MISSING_KEY)?;
+                self.curseforge(query).await
+            }
             Some(_) => Ok(vec![]),
             None => {
                 let (m, c) = tokio::join!(self.modrinth(query), self.curseforge(query));
@@ -281,7 +282,7 @@ impl Discovery {
                 let client = self
                     .curseforge
                     .as_ref()
-                    .context("CURSEFORGE_API_KEY is required")?;
+                    .context(crate::curseforge::MISSING_KEY)?;
                 let project = curseforge::find_modpack(client, pack).await?;
                 let mut files: Vec<Release> = curseforge::list_files(client, project.id)
                     .await?
@@ -365,6 +366,22 @@ pub fn literal(text: &str) -> Option<Pick> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn explicit_curseforge_discovery_without_key_is_an_error() {
+        let discovery = Discovery::with_curseforge_key(None).unwrap();
+        assert!(!discovery.has_curseforge());
+        let error = discovery
+            .search(Some(Provider::Curseforge), "atm10")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("CURSEFORGE_API_KEY"));
+        let error = discovery
+            .releases(Provider::Curseforge, "all-the-mods-10")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("CURSEFORGE_API_KEY"));
+    }
 
     #[test]
     fn literal_reads_paths_and_allowed_urls() {

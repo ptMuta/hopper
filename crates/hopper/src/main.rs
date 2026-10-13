@@ -23,6 +23,7 @@ mod chat;
 mod cli;
 mod curseforge;
 mod discover;
+mod elevation;
 #[cfg(test)]
 mod engine_tests;
 mod gtnh;
@@ -45,7 +46,7 @@ use cli::{Cli, exit};
 
 fn main() {
     let cli = interface::App::parse();
-    let code = match interface::run(&cli) {
+    let code = match elevation::ensure_privileges(&cli).and_then(|()| interface::run(&cli)) {
         Ok(code) => code,
         Err(e) if e.is::<prompt::Cancelled>() || e.is::<prompt::Back>() => exit::CANCELLED,
         Err(e) => {

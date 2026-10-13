@@ -24,6 +24,27 @@ use hopper_core::source::mrpack::{
 
 /// The environment variable the API key is read from.
 pub const KEY_ENV: &str = "CURSEFORGE_API_KEY";
+pub const MISSING_KEY: &str = "CurseForge requires CURSEFORGE_API_KEY; export it before running hopper (with sudo, use --preserve-env=CURSEFORGE_API_KEY)";
+
+pub fn require_api_key(key: Option<String>) -> Result<String> {
+    let key = key.filter(|k| !k.trim().is_empty()).context(MISSING_KEY)?;
+    anyhow::ensure!(
+        key.bytes().all(|b| b.is_ascii_graphic()),
+        "invalid CurseForge API key: expected a single token without whitespace"
+    );
+    Ok(key)
+}
+
+pub fn client(key: Option<String>, user_agent: &str) -> Result<HttpClient> {
+    let key = require_api_key(key)?;
+    HttpClient::with_secret_header(
+        user_agent,
+        HostAllowlist::curseforge_api(),
+        cf::KEY_HEADER,
+        &key,
+    )
+    .context("building the CurseForge API client")
+}
 
 pub struct Options<'a> {
     pub api_key: Option<&'a str>,
@@ -64,12 +85,15 @@ pub enum Outcome {
 /// The API key from the flag or the environment.
 pub fn api_key(flag: Option<&str>) -> Option<String> {
     flag.map(str::to_owned)
+        .filter(|k| !k.trim().is_empty())
         .or_else(|| std::env::var(KEY_ENV).ok())
+        .filter(|k| !k.trim().is_empty())
         .or_else(|| {
             std::env::var_os("CREDENTIALS_DIRECTORY").and_then(|dir| {
                 std::fs::read_to_string(std::path::PathBuf::from(dir).join("curseforge")).ok()
             })
         })
+        .filter(|k| !k.trim().is_empty())
         .or_else(|| {
             std::env::var_os("HOPPER_CREDENTIAL_FILE")
                 .and_then(|path| std::fs::read_to_string(path).ok())
@@ -100,13 +124,7 @@ pub async fn resolve(
 
     // The keyed client can reach only the API host, so a redirect cannot carry the key off
     // anywhere else. Files come from the CDN through a client that never sees the key.
-    let api = HttpClient::with_secret_header(
-        opts.user_agent,
-        HostAllowlist::curseforge_api(),
-        cf::KEY_HEADER,
-        key,
-    )
-    .context("building the CurseForge API client")?;
+    let api = client(Some(key.to_owned()), opts.user_agent)?;
     let cdn = HttpClient::new(opts.user_agent, HostAllowlist::curseforge_files())
         .context("building the CurseForge download client")?;
 

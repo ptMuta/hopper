@@ -31,6 +31,7 @@ mod instances;
 mod interface;
 mod managed;
 mod migration;
+mod network;
 mod prompt;
 mod render;
 mod resolve;
@@ -959,7 +960,10 @@ async fn finish_install(
             .and_then(|d| hopper_core::server::properties::get(d, "server-port"))
             .and_then(|p| p.parse().ok())
             .unwrap_or(hopper_core::server::ports::DEFAULT_SERVER_PORT);
-        let port = instances::pick_server_port_from(root, wanted);
+        let port = cli
+            .install
+            .game_port
+            .unwrap_or_else(|| instances::pick_server_port_from(root, wanted));
         hfs::write_atomic(
             &props,
             hopper_core::server::seed_server_properties(pack_defaults.as_deref(), port).as_bytes(),

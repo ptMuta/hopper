@@ -300,26 +300,16 @@ pub async fn onboard(
             "--java must be outside the installation being moved; use a stable external JVM path"
         );
     }
-    let game_port =
-        hopper_core::server::properties::get(&props, "server-port").and_then(|p| p.parse().ok());
-    let rcon_port =
-        hopper_core::server::properties::get(&props, "rcon.port").and_then(|p| p.parse().ok());
+    let game_port = crate::network::configured_port(&props, "server-port")?;
+    let rcon_port = crate::network::configured_port(&props, "rcon.port")?;
     if let Some(world) = hopper_core::server::properties::get(&props, "level-name") {
         RelPath::parse(world).context(
             "world must be within the installation; external worlds cannot be moved safely",
         )?;
     }
-    for property in ["server-port", "rcon.port"] {
-        if let Some(port) =
-            hopper_core::server::properties::get(&props, property).and_then(|p| p.parse().ok())
-        {
-            ensure!(
-                crate::instances::port_free(port),
-                "port {port} is listening; stop this server and disable its old supervisor before onboarding"
-            );
-        }
-    }
-    managed::onboarding_ports(record, game_port, rcon_port)?;
+    managed::assign_ports(record, game_port, rcon_port)?;
+    record.listen_address =
+        hopper_core::server::properties::get(&props, "server-ip").map(str::to_owned);
     let old_lock = crate::read_lockfile(&from)?;
     let baseline = installed.map(str::to_owned).or_else(|| old_lock.as_ref().and_then(|l| l.pack.version_label.clone()))
         .or_else(|| fs::read(from.join("manifest.json")).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())

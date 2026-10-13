@@ -35,7 +35,6 @@ pub struct Instance {
     pub restart: String,
     pub warn: u32,
     pub started: bool,
-    pub firewall_port: Option<u16>,
     pub backup: Option<PathBuf>,
     pub original: Option<PathBuf>,
     #[serde(default)]
@@ -49,33 +48,14 @@ pub struct Instance {
     #[serde(default)]
     pub rcon_port: Option<u16>,
     #[serde(default)]
+    pub listen_address: Option<String>,
+    #[serde(default)]
     pub installed_version: Option<String>,
 }
 
 impl Instance {
     pub fn new(scope: Scope, name: &str, source: Source, runtime: RuntimeOptions) -> Result<Self> {
         validate_name(name)?;
-        let mut taken = std::collections::BTreeSet::new();
-        for record in list(scope)?
-            .into_iter()
-            .filter(|r| r.state != State::Detached)
-        {
-            taken.extend(record.game_port);
-            taken.extend(record.rcon_port);
-        }
-        if scope == Scope::User {
-            for record in list(Scope::System)? {
-                taken.extend(record.game_port);
-                taken.extend(record.rcon_port);
-            }
-        }
-        let game_port =
-            hopper_core::server::ports::pick(25565, &taken, crate::instances::port_free)
-                .context("no free game port")?;
-        taken.insert(game_port);
-        let rcon_port =
-            hopper_core::server::ports::pick(25575, &taken, crate::instances::port_free)
-                .context("no free RCON port")?;
         Ok(Self {
             format: 1,
             name: name.into(),
@@ -88,14 +68,14 @@ impl Instance {
             restart: "off".into(),
             warn: 300,
             started: false,
-            firewall_port: None,
             backup: None,
             original: None,
             onboarding_target: None,
             storage_ready: false,
             account_created: false,
-            game_port: Some(game_port),
-            rcon_port: Some(rcon_port),
+            game_port: None,
+            rcon_port: None,
+            listen_address: None,
             installed_version: None,
         })
     }
@@ -336,6 +316,7 @@ pub fn resume_prepare(record: &mut Instance) -> Result<()> {
         record.state == State::Pending && !record.storage_ready,
         "storage is already initialized"
     );
+    assign_ports(record, record.game_port, record.rcon_port)?;
     if record.scope == Scope::System {
         preflight(Scope::System)?;
         trusted_dir(&data_root(Scope::System)?)?;
@@ -558,8 +539,16 @@ pub fn invoke(record: &Instance, operation: &str, args: &[String]) -> Result<i32
     Ok(status.code().unwrap_or(1))
 }
 pub fn capture(record: &Instance, operation: &str) -> Result<String> {
-    let output = worker_command(record, operation, &[])?.output()?;
-    ensure!(output.status.success(), "instance inspection failed");
+    capture_args(record, operation, &[])
+}
+
+pub fn capture_args(record: &Instance, operation: &str, args: &[String]) -> Result<String> {
+    let output = worker_command(record, operation, args)?.output()?;
+    ensure!(
+        output.status.success(),
+        "instance {operation} failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 pub fn refresh(record: &mut Instance) -> Result<()> {
@@ -570,6 +559,7 @@ pub fn refresh(record: &mut Instance) -> Result<()> {
     record.rcon_port = info["rcon_port"]
         .as_u64()
         .and_then(|p| u16::try_from(p).ok());
+    record.listen_address = info["listen_address"].as_str().map(str::to_owned);
     record.installed_version = info["version"].as_str().map(str::to_owned);
     if record.source.provider == crate::interface::Provider::Gtnh
         && record.runtime.java_major.is_none()
@@ -587,8 +577,14 @@ pub fn refresh(record: &mut Instance) -> Result<()> {
     save(record)
 }
 
-/// Preserve onboarding ports only when no other managed instance has reserved them.
-pub fn onboarding_ports(record: &mut Instance, game: Option<u16>, rcon: Option<u16>) -> Result<()> {
+/// Explicit ports are operator choices; allocate only missing ports.
+pub fn assign_ports(record: &mut Instance, game: Option<u16>, rcon: Option<u16>) -> Result<()> {
+    ensure!(game != Some(0) && rcon != Some(0), "ports must be nonzero");
+    if game.is_some() && rcon.is_some() {
+        record.game_port = game;
+        record.rcon_port = rcon;
+        return Ok(());
+    }
     let mut records = list(record.scope)?;
     if record.scope == Scope::User {
         records.extend(list(Scope::System)?);
@@ -600,19 +596,22 @@ pub fn onboarding_ports(record: &mut Instance, game: Option<u16>, rcon: Option<u
         taken.extend(other.game_port);
         taken.extend(other.rcon_port);
     }
-    let game = hopper_core::server::ports::pick(
-        game.or(record.game_port).unwrap_or(25565),
+    taken.extend(rcon);
+    let game = hopper_core::server::ports::resolve(
+        game,
+        record.game_port.unwrap_or(25565),
         &taken,
         crate::instances::port_free,
     )
-    .context("no free onboarding game port")?;
+    .context("no free game port")?;
     taken.insert(game);
-    let rcon = hopper_core::server::ports::pick(
-        rcon.or(record.rcon_port).unwrap_or(25575),
+    let rcon = hopper_core::server::ports::resolve(
+        rcon,
+        record.rcon_port.unwrap_or(25575),
         &taken,
         crate::instances::port_free,
     )
-    .context("no free onboarding RCON port")?;
+    .context("no free RCON port")?;
     record.game_port = Some(game);
     record.rcon_port = Some(rcon);
     Ok(())
@@ -892,19 +891,7 @@ fn activate_timers(record: &Instance) -> Result<()> {
     }
     Ok(())
 }
-pub fn rcon_port(record: &Instance) -> Result<u16> {
-    if record.scope == Scope::System {
-        return capture(record, "rcon-port")?
-            .parse()
-            .context("invalid worker RCON port");
-    }
-    let text = fs::read_to_string(record.server().join("server.properties"))?;
-    hopper_core::server::properties::get(&text, "rcon.port")
-        .context("missing RCON port")?
-        .parse()
-        .context("invalid RCON port")
-}
-pub fn start(record: &mut Instance, firewall: bool) -> Result<()> {
+pub fn start(record: &mut Instance) -> Result<()> {
     let _guard = operation_lock(record)?;
     ensure!(
         record.state == State::Ready,
@@ -916,15 +903,6 @@ pub fn start(record: &mut Instance, firewall: bool) -> Result<()> {
     );
     if record.scope == Scope::System {
         ensure!(is_root(), "system start requires root");
-        let port = rcon_port(record)?;
-        if firewall {
-            record.firewall_port = Some(port);
-            save(record)?;
-        }
-        ensure!(
-            record.firewall_port == Some(port),
-            "RCON port {port} must be blocked externally; confirm using --rcon-firewall-confirmed after configuring your firewall"
-        );
     }
     checked(
         ctl(record.scope).args(["enable", "--now", &record.unit()]),
@@ -937,7 +915,6 @@ pub fn start(record: &mut Instance, firewall: bool) -> Result<()> {
         println!(
             "User service enabled. For startup without a login, enable lingering with loginctl enable-linger."
         );
-        println!("RCON must not be exposed to untrusted networks; protect it with your firewall.");
     }
     Ok(())
 }
@@ -1017,13 +994,6 @@ pub fn maintain(
     let _guard = operation_lock(record)?;
     let cancellation = cancellation(record)?;
     let token = fs::read(&cancellation).ok();
-    if record.scope == Scope::System {
-        let port = rcon_port(record)?;
-        ensure!(
-            record.firewall_port == Some(port),
-            "RCON port changed; reconfirm firewall before maintenance"
-        );
-    }
     let mut changed = if update {
         match invoke(record, "check", &[])? {
             0 => false,
@@ -1208,6 +1178,16 @@ pub fn logs(record: &Instance, args: &[String]) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_managed_ports_need_no_allocation_or_privilege_probe() {
+        let mut record = record(Scope::System);
+        assert_eq!((record.game_port, record.rcon_port), (None, None));
+        assign_ports(&mut record, Some(25565), Some(25575)).unwrap();
+        assert_eq!(
+            (record.game_port, record.rcon_port),
+            (Some(25565), Some(25575))
+        );
+    }
     #[test]
     fn supplied_key_replaces_saved_key_and_is_available_without_environment() {
         let temp = tempfile::tempdir().unwrap();

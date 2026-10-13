@@ -83,9 +83,7 @@ pub fn stop_server(dir: &Path, pid: u32) -> Result<i32> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(25575);
     let password = properties::get(&text, "rcon.password").unwrap_or_default();
-    let host = properties::get(&text, "server-ip")
-        .filter(|h| !h.is_empty())
-        .unwrap_or("127.0.0.1");
+    let host = crate::network::connect_address(properties::get(&text, "server-ip"));
 
     match Rcon::connect((host, port), password).and_then(|mut r| r.command("stop")) {
         Ok(_) => println!("Sent stop over RCON; waiting for the server to save and exit"),
@@ -235,10 +233,7 @@ fn rcon_target(dir: &Path, unit: Option<&str>) -> Result<RconTarget> {
         password: properties::get(&text, "rcon.password")
             .unwrap_or_default()
             .to_owned(),
-        host: properties::get(&text, "server-ip")
-            .filter(|h| !h.is_empty())
-            .unwrap_or("127.0.0.1")
-            .to_owned(),
+        host: crate::network::connect_address(properties::get(&text, "server-ip")).to_owned(),
     })
 }
 

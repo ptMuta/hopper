@@ -56,4 +56,5 @@ not an unconditional optimization for arbitrary older Forge packs.
 Keep verified, off-host world backups and test recovery. A scheduled graceful restart
 is maintenance, not a cure for a memory leak. Monitor exit status and failed maintenance
 jobs. Allow the configured warning and stop timeout; systemd's final SIGTERM fallback
-is not proof that a world was saved. Keep RCON firewalled, even with private passwords.
+is not proof that a world was saved. Use `hopper ports` and `hopper listen` to manage
+the instance's network settings; firewall policy remains with the administrator.

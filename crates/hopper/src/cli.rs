@@ -186,6 +186,9 @@ pub struct InstallArgs {
     pub native_launch: Option<hopper_core::loader::LaunchProfile>,
     #[arg(skip)]
     pub managed_launcher: bool,
+    /// Port already assigned by the managed coordinator; do not probe it again.
+    #[arg(skip)]
+    pub game_port: Option<u16>,
     #[arg(skip)]
     pub collection_channel: Option<String>,
     /// Pack to install: a slug, a .mrpack file, a URL, a collection, or cf:<slug>

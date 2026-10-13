@@ -164,6 +164,85 @@ fn curseforge_instance_commands_fail_before_changes_but_local_status_needs_no_ke
 }
 
 #[test]
+fn network_verbs_read_and_worker_updates_preserve_operator_settings() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config/hopper/instances");
+    let server = root.path().join("data/servers/atm10/server");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&server).unwrap();
+    let record = serde_json::json!({
+        "format": 1, "name": "atm10", "scope": "user",
+        "root": server.parent().unwrap(),
+        "source": {"provider": "gtnh", "pack": null, "collection": null,
+                   "file": null, "url": null, "channel": null, "pack_version": null,
+                   "mc": null, "loader": null},
+        "runtime": {"java": null, "java_major": null, "java_vendor": null, "jvm_args_file": null,
+                    "no_optional": false, "force_include": [], "force_exclude": [],
+                    "allow_client_pack": false, "skip_blocked": false},
+        "state": "ready", "update": "off", "restart": "off", "warn": 300,
+        "started": false, "firewall_port": 25575, "backup": null, "original": null,
+    });
+    std::fs::write(
+        config.join("atm10.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    let props = server.join("server.properties");
+    let initial = "# operator\nmotd=hello\nserver-port=25565\nrcon.port=25575\nrcon.password=private\nserver-ip=\n";
+    std::fs::write(&props, initial).unwrap();
+    for verb in ["ports", "listen"] {
+        let output = run(&[verb, "atm10", "--json"], root.path());
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let settings: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(settings["game"], 25565);
+        assert_eq!(settings["rcon"], 25575);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("private"));
+    }
+    assert_eq!(std::fs::read_to_string(&props).unwrap(), initial);
+    let output = run(
+        &["ports", "atm10", "--game", "25000", "--rcon", "25001"],
+        root.path(),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = run(&["listen", "atm10", "192.0.2.10"], root.path());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config.join("atm10.json")).unwrap()).unwrap();
+    assert_eq!(saved["game_port"], 25000);
+    assert_eq!(saved["rcon_port"], 25001);
+    assert_eq!(saved["listen_address"], "192.0.2.10");
+    assert!(saved.get("firewall_port").is_none());
+    let change = r#"{"game":25566,"rcon":25576,"address":"::1"}"#;
+    let output = run(&["__worker", "atm10", "network", "--", change], root.path());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = std::fs::read_to_string(&props).unwrap();
+    assert!(text.contains("server-port=25566\n"));
+    assert!(text.contains("rcon.port=25576\n"));
+    assert!(text.contains("server-ip=::1\n"));
+    assert!(text.contains("# operator\nmotd=hello\n"));
+    assert!(text.contains("rcon.password=private\n"));
+}
+
+#[test]
 fn service_prelaunch_rejects_conflicts_until_explicitly_resolved() {
     if unsafe { libc::geteuid() } == 0 {
         return;

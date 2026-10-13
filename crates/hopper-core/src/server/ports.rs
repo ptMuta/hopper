@@ -33,9 +33,31 @@ pub fn pick(start: u16, taken: &BTreeSet<u16>, is_free: impl Fn(u16) -> bool) ->
     (start..=u16::MAX).find(|p| !taken.contains(p) && is_free(*p))
 }
 
+/// Keep an explicit port without probing the network; allocate only when unspecified.
+pub fn resolve(
+    explicit: Option<u16>,
+    start: u16,
+    taken: &BTreeSet<u16>,
+    is_free: impl Fn(u16) -> bool,
+) -> Option<u16> {
+    explicit.or_else(|| pick(start, taken, is_free))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_ports_are_preserved_without_a_bind_probe() {
+        let taken = BTreeSet::from([25565]);
+        assert_eq!(
+            resolve(Some(25565), 25565, &taken, |_| panic!(
+                "explicit port must not be probed"
+            )),
+            Some(25565)
+        );
+        assert_eq!(resolve(None, 25565, &taken, |p| p != 25566), Some(25567));
+    }
 
     #[test]
     fn a_properties_file_claims_its_enabled_ports() {

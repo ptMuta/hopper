@@ -106,6 +106,8 @@ mod tests {
             vec!["remove", "world"],
             vec!["status", "world"],
             vec!["list"],
+            vec!["ports", "world", "--game", "25566"],
+            vec!["listen", "world", "::1"],
             vec!["disable", "world", "mod.jar"],
             vec!["enable", "world", "mod.jar"],
             vec!["show", "world"],

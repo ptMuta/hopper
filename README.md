@@ -54,7 +54,7 @@ fails at once, naming all of them, with exit 2.
 | --- | --- | --- |
 | missing argument | asked | exit 2, listing every missing flag |
 | `stop`/`restart` a running server, `remove`, `update` while running, `onboard` | asked, default no (update: yes) | proceeds, as before |
-| EULA, client-pack builds, RCON firewall | asked, default no | needs `--eula`, `--allow-client-pack`, `--rcon-firewall-confirmed` |
+| EULA, client-pack builds | asked, default no | needs `--eula`, `--allow-client-pack` |
 | `-y`, `--yes` | takes every default; still asks what has none | proceeds; consent still needs its flag |
 | `--no-input`, `HOPPER_NO_INPUT=1`, `CI`, `--json` | never asks | never asks |
 
@@ -213,9 +213,9 @@ record operator choices for later updates.
 User is always the default, even under sudo. Select `--scope system` explicitly:
 
 ```sh
-sudo hopper install production --scope system --provider gtnh --eula
-sudo hopper start production --scope system --rcon-firewall-confirmed
-sudo hopper configure production --scope system --restart daily
+hopper install production --scope system --provider gtnh --eula
+hopper start production --scope system
+hopper configure production --scope system --restart daily
 ```
 
 User storage is under XDG data `hopper/servers/NAME/server`, instance records under XDG
@@ -231,10 +231,20 @@ trusted configuration and systemd. Units use no-new-privileges, empty capability
 private devices/tmp, protected home/system/kernel paths and narrowly scoped writable
 directories. Executable-memory denial is deliberately absent because Java uses a JIT.
 
-Hopper does not configure your firewall. Block RCON externally before starting any
-instance; Minecraft commonly exposes it beyond localhost. System activation requires
-`--rcon-firewall-confirmed`, tied to the current RCON port; changing it requires
-reconfirmation. Open only the game port to players.
+Hopper leaves firewall and exposure policy to the administrator. It allocates free ports
+when unspecified and preserves explicit ports without probing or renumbering them.
+Use these commands to inspect or change an instance's network settings:
+
+```sh
+hopper ports production --scope system
+hopper ports production --scope system --game 25566 --rcon 25576
+hopper listen production --scope system 192.0.2.10
+hopper listen production --scope system '*'
+```
+
+`listen` edits Minecraft's `server-ip`; use an IPv4/IPv6 address, `localhost`, or `*`
+for all interfaces. Without an address it shows the current settings. Changes take
+effect on the next start. The file's other properties and RCON password are preserved.
 
 ## Operations and recovery
 

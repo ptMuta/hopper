@@ -261,8 +261,6 @@ pub struct Create {
     /// Enable and start after successful installation.
     #[arg(long)]
     pub start: bool,
-    #[arg(long)]
-    pub rcon_firewall_confirmed: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -296,8 +294,6 @@ pub enum Action {
         restart: Option<String>,
         #[arg(long)]
         warn: Option<u32>,
-        #[arg(long)]
-        rcon_firewall_confirmed: bool,
     },
     List,
     Status {
@@ -311,8 +307,20 @@ pub enum Action {
     },
     Start {
         name: Option<String>,
-        #[arg(long)]
-        rcon_firewall_confirmed: bool,
+    },
+    /// Show or change game and RCON ports; changes apply on the next start.
+    Ports {
+        name: Option<String>,
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+        game: Option<u16>,
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+        rcon: Option<u16>,
+    },
+    /// Show or change the server listen address; use * for all interfaces.
+    Listen {
+        name: Option<String>,
+        #[arg(value_parser = crate::network::parse_address)]
+        address: Option<String>,
     },
     Stop {
         name: Option<String>,
@@ -560,7 +568,6 @@ pub async fn run(app: &App) -> Result<i32> {
             update: None,
             restart: None,
             warn: None,
-            rcon_firewall_confirmed: false,
         } if crate::prompt::enabled() && !crate::prompt::assume_defaults() => {
             let record = crate::resolve::instance(
                 app.scope,
@@ -583,7 +590,6 @@ pub async fn run(app: &App) -> Result<i32> {
                     update: settings.update,
                     restart: settings.restart,
                     warn: settings.warn,
-                    rcon_firewall_confirmed: false,
                 },
             )
         }
@@ -615,6 +621,7 @@ fn engine(app: &App, record: Option<&Instance>) -> crate::cli::Cli {
         cli.install.allow_client_pack = record.runtime.allow_client_pack;
         cli.install.skip_blocked = record.runtime.skip_blocked;
         cli.install.managed_launcher = true;
+        cli.install.game_port = record.game_port;
         cli.install.collection_channel = Some(
             record
                 .source
@@ -635,6 +642,13 @@ async fn worker(app: &App, record: &Instance, operation: &str, args: &[String]) 
     match operation {
         "start-check" => {
             crate::service::ensure_conflicts_resolved(&record.server())?;
+            Ok(0)
+        }
+        "network" => {
+            let change: crate::network::Change =
+                serde_json::from_str(args.first().context("missing network settings")?)?;
+            let settings = crate::network::worker(&record.server(), &change)?;
+            println!("{}", serde_json::to_string(&settings)?);
             Ok(0)
         }
         "status" => crate::status(&record.server()),
@@ -675,36 +689,30 @@ async fn worker(app: &App, record: &Instance, operation: &str, args: &[String]) 
             hopper_core::fs::write_private_atomic(&path, text.as_bytes())?;
             let setup = crate::service::ensure_rcon(&record.server())?;
             println!(
-                "RCON port {} configured (changed={}); block external access.",
+                "RCON port {} configured (changed={}).",
                 setup.port, setup.changed
             );
             Ok(0)
         }
-        "rcon-port" | "inspect" => {
+        "inspect" => {
             let text = std::fs::read_to_string(record.server().join("server.properties"))?;
             let port: u16 = hopper_core::server::properties::get(&text, "rcon.port")
                 .context("missing RCON port")?
                 .parse()?;
-            if operation == "rcon-port" {
-                println!("{port}");
-            } else {
-                let lock = crate::read_lockfile(&record.server())?.context("missing lock")?;
-                let game: u16 = hopper_core::server::properties::get(&text, "server-port")
-                    .context("missing game port")?
-                    .parse()?;
-                println!(
-                    "{}",
-                    serde_json::json!({"game_port":game,"rcon_port":port,"version":lock.pack.version_label,"project_id":lock.pack.project_id,"java_major":lock.server.java_major})
-                );
-            }
+            let lock = crate::read_lockfile(&record.server())?.context("missing lock")?;
+            let game: u16 = hopper_core::server::properties::get(&text, "server-port")
+                .context("missing game port")?
+                .parse()?;
+            println!(
+                "{}",
+                serde_json::json!({"game_port":game,"rcon_port":port,"listen_address":hopper_core::server::properties::get(&text,"server-ip").unwrap_or_default(),"version":lock.pack.version_label,"project_id":lock.pack.project_id,"java_major":lock.server.java_major})
+            );
             Ok(0)
         }
         "rcon" => {
             let text = std::fs::read_to_string(record.server().join("server.properties"))?;
             let get = |key| hopper_core::server::properties::get(&text, key);
-            let host = get("server-ip")
-                .filter(|s| !s.is_empty())
-                .unwrap_or("127.0.0.1");
+            let host = crate::network::connect_address(get("server-ip"));
             let port: u16 = get("rcon.port").context("RCON port missing")?.parse()?;
             let mut rcon = hopper_core::server::rcon::Rcon::connect(
                 (host, port),
@@ -1061,7 +1069,7 @@ async fn create_instance(
         managed::save(&existing)?;
         drop(_guard);
         if plan.start {
-            managed::start(&mut existing, create.rcon_firewall_confirmed)?;
+            managed::start(&mut existing)?;
         }
         println!("Reattached {}; retained data unchanged.", existing.name);
         return Ok(0);
@@ -1150,7 +1158,7 @@ async fn create_instance(
     // Asked, if at all, by the wizard before anything was downloaded.
     if plan.start {
         drop(_guard);
-        managed::start(&mut record, create.rcon_firewall_confirmed)?;
+        managed::start(&mut record)?;
     }
     Ok(0)
 }
@@ -1168,6 +1176,8 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
         Restart { name } => (name, Need::Running, "restart"),
         Remove { name } => (name, Need::Change, "remove"),
         Repair { name } => (name, Need::Stopped, "repair"),
+        Ports { name, .. } => (name, Need::Look, "ports"),
+        Listen { name, .. } => (name, Need::Look, "listen"),
         Disable { name, .. } => (name, Need::Change, "disable"),
         Enable { name, .. } => (name, Need::Change, "enable"),
         Show { name, .. } => (name, Need::Look, "show"),
@@ -1222,7 +1232,6 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
             update,
             restart,
             warn,
-            rcon_firewall_confirmed,
             ..
         } => {
             managed::check_credentials(record.scope, &record.name, record.source.provider)?;
@@ -1255,9 +1264,6 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
             if let Some(warn) = warn {
                 ensure!(*warn <= 86400, "warning exceeds one day");
                 record.warn = *warn;
-            }
-            if *rcon_firewall_confirmed {
-                record.firewall_port = managed::rcon_port(&record).ok();
             }
             managed::store_credentials(&record)?;
             managed::save(&record)?;
@@ -1315,13 +1321,28 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
             managed::maintain(&record, true, false, asking.then_some(&ask as _))
         }
         Restart { .. } => managed::maintain(&record, false, true, None),
-        Start {
-            rcon_firewall_confirmed,
-            ..
-        } => {
-            managed::start(&mut record, *rcon_firewall_confirmed)?;
+        Start { .. } => {
+            managed::start(&mut record)?;
             Ok(0)
         }
+        Ports { game, rcon, .. } => crate::network::configure(
+            &mut record,
+            crate::network::Change {
+                game: *game,
+                rcon: *rcon,
+                address: None,
+            },
+            app.json,
+        ),
+        Listen { address, .. } => crate::network::configure(
+            &mut record,
+            crate::network::Change {
+                game: None,
+                rcon: None,
+                address: address.clone(),
+            },
+            app.json,
+        ),
         Stop { .. } => {
             managed::stop(&record)?;
             Ok(0)
@@ -1427,6 +1448,27 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn network_verbs_accept_explicit_settings_without_firewall_flags() {
+        for args in [
+            vec![
+                "hopper", "ports", "atm10", "--game", "25566", "--rcon", "25576",
+            ],
+            vec!["hopper", "listen", "atm10", "::1"],
+            vec!["hopper", "listen", "atm10", "*"],
+            vec!["hopper", "start", "atm10", "--scope", "system"],
+        ] {
+            assert!(App::try_parse_from(args).is_ok());
+        }
+        for args in [
+            vec!["hopper", "ports", "atm10", "--game", "0"],
+            vec!["hopper", "ports", "atm10", "--rcon", "65536"],
+            vec!["hopper", "listen", "atm10", "invalid-address"],
+        ] {
+            assert!(App::try_parse_from(args).is_err());
+        }
+    }
+
     #[test]
     fn stop_helper_accepts_an_already_exited_main_process() {
         for args in [

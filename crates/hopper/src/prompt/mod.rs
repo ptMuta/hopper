@@ -930,7 +930,7 @@ pub fn ask(key: &str, default: bool) -> Result<bool> {
     yes_no(key, "", default, ["yes", "no"])
 }
 
-/// Agreement only a person can give (EULA, client pack, firewall): never assumed, never
+/// Agreement only a person can give (EULA, client pack): never assumed, never
 /// taken from `-y`, default no. False when nobody can be asked.
 pub fn consent(question: &str) -> Result<bool> {
     agree(question, "")

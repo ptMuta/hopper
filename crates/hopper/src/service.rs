@@ -79,11 +79,10 @@ pub fn stop_server(dir: &Path, pid: u32) -> Result<i32> {
         return Ok(exit::OK);
     }
     let text = std::fs::read_to_string(dir.join("server.properties")).unwrap_or_default();
-    let port: u16 = properties::get(&text, "rcon.port")
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(25575);
+    let active = crate::network::current(dir).ok();
+    let port = active.as_ref().map(|s| s.rcon).unwrap_or(25575);
     let password = properties::get(&text, "rcon.password").unwrap_or_default();
-    let host = crate::network::connect_address(properties::get(&text, "server-ip"));
+    let host = crate::network::connect_address(active.as_ref().map(|s| s.address.as_str()));
 
     match Rcon::connect((host, port), password).and_then(|mut r| r.command("stop")) {
         Ok(_) => println!("Sent stop over RCON; waiting for the server to save and exit"),
@@ -226,14 +225,13 @@ fn rcon_target(dir: &Path, unit: Option<&str>) -> Result<RconTarget> {
             None => bail!("RCON is off for this server; onboard it as a managed instance first"),
         }
     }
+    let active = crate::network::current(dir)?;
     Ok(RconTarget {
-        port: properties::get(&text, "rcon.port")
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(25575),
+        port: active.rcon,
         password: properties::get(&text, "rcon.password")
             .unwrap_or_default()
             .to_owned(),
-        host: crate::network::connect_address(properties::get(&text, "server-ip")).to_owned(),
+        host: crate::network::connect_address(Some(&active.address)).to_owned(),
     })
 }
 
@@ -243,10 +241,10 @@ pub fn connect_waiting(dir: &Path) -> Result<Rcon> {
     use hopper_core::server::rcon::RconError;
 
     let unit = unit_for(dir);
-    let target = rcon_target(dir, unit.as_deref())?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15 * 60);
     let mut said = false;
     loop {
+        let target = rcon_target(dir, unit.as_deref())?;
         match Rcon::connect((target.host.as_str(), target.port), &target.password) {
             Ok(r) => return Ok(r),
             Err(RconError::Connect(e)) => {
@@ -342,6 +340,36 @@ fn print_response(text: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pending_network_changes_keep_rcon_on_the_running_endpoint_until_start() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("server.properties"),
+            "server-ip=0.0.0.0\nrcon.port=25575\nenable-rcon=true\nrcon.password=private\n",
+        )
+        .unwrap();
+        crate::network::snapshot(temp.path()).unwrap();
+        crate::network::worker(
+            temp.path(),
+            &crate::network::Change {
+                rcon: Some(25576),
+                address: Some("::1".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let target = super::rcon_target(temp.path(), None).unwrap();
+        assert_eq!(
+            (target.host.as_str(), target.port, target.password.as_str()),
+            ("127.0.0.1", 25575, "private")
+        );
+        crate::network::snapshot(temp.path()).unwrap();
+        let target = super::rcon_target(temp.path(), None).unwrap();
+        assert_eq!(
+            (target.host.as_str(), target.port, target.password.as_str()),
+            ("::1", 25576, "private")
+        );
+    }
     #[test]
     fn conflicts_block_start_until_sidecars_are_removed() {
         let temp = tempfile::tempdir().unwrap();

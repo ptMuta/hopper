@@ -543,6 +543,7 @@ pub async fn run(app: &App) -> Result<i32> {
         Action::StartCheck { dir } => {
             ensure!(!managed::is_root(), "start checks must run unprivileged");
             crate::service::ensure_conflicts_resolved(dir)?;
+            crate::network::snapshot(dir)?;
             Ok(0)
         }
         Action::StopWorker { dir, pid } => {
@@ -712,8 +713,9 @@ async fn worker(app: &App, record: &Instance, operation: &str, args: &[String]) 
         "rcon" => {
             let text = std::fs::read_to_string(record.server().join("server.properties"))?;
             let get = |key| hopper_core::server::properties::get(&text, key);
-            let host = crate::network::connect_address(get("server-ip"));
-            let port: u16 = get("rcon.port").context("RCON port missing")?.parse()?;
+            let active = crate::network::current(&record.server())?;
+            let host = crate::network::connect_address(Some(&active.address));
+            let port = active.rcon;
             let mut rcon = hopper_core::server::rcon::Rcon::connect(
                 (host, port),
                 get("rcon.password").context("RCON password missing")?,

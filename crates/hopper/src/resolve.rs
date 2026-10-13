@@ -194,8 +194,15 @@ pub fn instance(scope: Scope, name: Option<&str>, need: Need, command: &str) -> 
 
 /// Players online, asked of the server itself; `None` when it does not answer within a second.
 pub fn players(record: &Instance) -> Option<u32> {
-    let port = record.game_port?;
-    let host = crate::network::connect_address(record.listen_address.as_deref()).to_owned();
+    let active = crate::network::current(&record.server()).ok();
+    let port = active.as_ref().map(|s| s.game).or(record.game_port)?;
+    let host = crate::network::connect_address(
+        active
+            .as_ref()
+            .map(|s| s.address.as_str())
+            .or(record.listen_address.as_deref()),
+    )
+    .to_owned();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(hopper_core::server::ping::ping(&host, port).map(|s| s.online));

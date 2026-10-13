@@ -65,6 +65,27 @@ fn read(text: &str) -> Result<Settings> {
     })
 }
 
+/// Record the endpoints actually adopted at service start, without storing passwords.
+pub fn snapshot(server: &Path) -> Result<()> {
+    let path = server.join("server.properties");
+    if !path.exists() {
+        return Ok(());
+    }
+    let settings = read(&std::fs::read_to_string(path)?)?;
+    hopper_core::fs::write_private_atomic(
+        &server.join(".hopper/network-active.json"),
+        &serde_json::to_vec(&settings)?,
+    )?;
+    Ok(())
+}
+
+pub fn current(server: &Path) -> Result<Settings> {
+    if let Ok(bytes) = std::fs::read(server.join(".hopper/network-active.json")) {
+        return serde_json::from_slice(&bytes).context("reading active network settings");
+    }
+    read(&std::fs::read_to_string(server.join("server.properties"))?)
+}
+
 /// Executed by the instance owner, including for system instances.
 pub fn worker(server: &Path, change: &Change) -> Result<Settings> {
     let path = server.join("server.properties");
@@ -97,6 +118,10 @@ pub fn worker(server: &Path, change: &Change) -> Result<Settings> {
     };
     let settings = read(&updated)?;
     if updated != text {
+        // Instances already running an older Hopper have no startup snapshot yet.
+        if !server.join(".hopper/network-active.json").exists() {
+            snapshot(server)?;
+        }
         hopper_core::fs::write_private_atomic(&path, updated.as_bytes())?;
     }
     Ok(settings)
@@ -185,6 +210,21 @@ mod tests {
             !serde_json::to_string(&settings)
                 .unwrap()
                 .contains("private")
+        );
+        let active = current(temp.path()).unwrap();
+        assert_eq!(
+            (active.game, active.rcon, active.address.as_str()),
+            (25565, 25575, "")
+        );
+        let snapshot_text =
+            std::fs::read_to_string(temp.path().join(".hopper/network-active.json")).unwrap();
+        assert!(!snapshot_text.contains("private"));
+        assert!(!snapshot_text.contains("password"));
+        snapshot(temp.path()).unwrap();
+        let active = current(temp.path()).unwrap();
+        assert_eq!(
+            (active.game, active.rcon, active.address.as_str()),
+            (25000, 25001, "::1")
         );
         worker(
             temp.path(),

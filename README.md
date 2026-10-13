@@ -245,6 +245,8 @@ hopper listen production --scope system '*'
 `listen` edits Minecraft's `server-ip`; use an IPv4/IPv6 address, `localhost`, or `*`
 for all interfaces. Without an address it shows the current settings. Changes take
 effect on the next start. The file's other properties and RCON password are preserved.
+Hopper keeps using the running server's current endpoints for RCON and player counts
+until restart, when it adopts the new settings.
 
 ## Operations and recovery
 

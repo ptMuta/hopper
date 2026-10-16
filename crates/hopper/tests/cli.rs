@@ -14,6 +14,55 @@ fn run(args: &[&str], root: &std::path::Path) -> Output {
         .unwrap()
 }
 
+fn legacy_gtnh(root: &std::path::Path, state: &str) {
+    let directory = root.join("config/hopper/instances");
+    std::fs::create_dir_all(&directory).unwrap();
+    let record = serde_json::json!({
+        "format":1,"name":"world","scope":"user","root":root.join("data/servers/world"),
+        "source":{"provider":"gtnh","pack":null,"collection":null,"file":null,"url":null,"channel":null,"pack_version":null,"mc":null,"loader":null},
+        "runtime":{"java":null,"java_major":21,"java_vendor":null,"jvm_args_file":null,"no_optional":false,"force_include":[],"force_exclude":[],"allow_client_pack":false,"skip_blocked":false},
+        "state":state,"update":"off","restart":"off","warn":300,"started":false,"backup":null,"original":null
+    });
+    std::fs::write(
+        directory.join("world.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn legacy_instances_get_backup_defaults_and_empty_backup_list_without_services() {
+    let root = tempfile::tempdir().unwrap();
+    legacy_gtnh(root.path(), "ready");
+    let result = run(&["status", "world", "--json"], root.path());
+    assert!(result.status.success());
+    let record: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(record["backup_keep"], 2);
+    assert_eq!(record["startup_timeout"], 1200);
+    assert!(record["backups"].as_array().unwrap().is_empty());
+    let result = run(&["backups", "world", "--json"], root.path());
+    assert!(result.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&result.stdout).unwrap(),
+        serde_json::json!([])
+    );
+    assert!(!root.path().join("data").exists());
+}
+
+#[test]
+fn update_and_revert_errors_have_one_json_outcome() {
+    let root = tempfile::tempdir().unwrap();
+    legacy_gtnh(root.path(), "pending");
+    for operation in ["update", "revert"] {
+        let result = run(&[operation, "world", "--json"], root.path());
+        assert!(!result.status.success());
+        let outcome: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(outcome["instance"], "world");
+        assert_eq!(outcome["code"], 1);
+        assert!(outcome["error"].is_string());
+    }
+}
+
 #[test]
 fn curseforge_missing_key_fails_before_host_or_source_changes() {
     let root = tempfile::tempdir().unwrap();

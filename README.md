@@ -100,7 +100,8 @@ hopper update horizons
 ```
 
 Configure records a desired target but never applies pack files. Version downgrades are
-refused when the registry baseline can be compared; Hopper does not downgrade worlds.
+refused when the registry baseline can be compared; use `revert` to restore a matching
+older installation and world together.
 Changing provider/pack identity is not an update operation.
 
 CurseForge requires `CURSEFORGE_API_KEY`. The key is sent only to its API, never CDN
@@ -159,10 +160,68 @@ Only a changed update warns players. Restarts and changed updates use RCON warni
 save the world, and stop through the service's graceful stop helper before applying.
 A previously stopped server stays stopped. An operator stop cancels pending maintenance
 and prevents it restarting the server. Failed checks/staging/warnings leave the service
-untouched; failed apply leaves it stopped. The default warning period is five minutes.
+untouched. Failed apply or initial startup automatically restores the verified pre-update
+installation and world. Failed recovery leaves the server stopped for `hopper repair NAME`.
+The default warning period is five minutes.
 A combined update/restart calendar creates one maintenance job; update-only timers have
 randomized delay. Updates are persistent across downtime; restart timers are not.
 Operations are serialized per instance.
+
+## Automatic update backups and revert
+
+Every changed `hopper update NAME`, including scheduled updates, saves a verified
+whole-instance backup **after graceful shutdown and before applying files**. It includes
+all world directories and dimensions, configs, mods, access lists, launcher, Hopper lock
+and managed Java runtimes. The archive is private and stored under the instance's
+`backups/` directory, outside `server/`. Staging files and the backup store itself are
+excluded. Onboarding backups are separate and are never pruned by update retention.
+
+Hopper keeps the latest **two** verified update backups by default. A new archive must
+pass manifest, hash, permission and gzip verification before old backups are pruned.
+Rotation temporarily needs room for a third archive, and preflight reserves space for
+backup and restoration. A failed or changed backup aborts the update. Checks with no
+pack changes and restart-only jobs do not create backups.
+
+```sh
+hopper configure horizons --backup-keep 2 --startup-timeout 1200
+hopper configure horizons --pack-version 2.9.0-RC-2
+hopper update horizons
+hopper backups horizons
+hopper revert horizons
+# Or choose a listed restore point:
+hopper revert horizons --backup update-1790000000000000000
+```
+
+Interactive updates show a diff for each locally edited file changed upstream and ask
+whether to keep local or use incoming, defaulting to local. Binary files show hashes and
+sizes. Previously acknowledged edits are reviewed again when upstream changes. Choices
+are bound to file hashes and rechecked after shutdown. Accepted choices do not create
+`.new` sidecars. Scheduled updates, `--yes`, `--no-input`, and `--json` skip the whole
+update when a conflict needs review (exit 10), leaving the existing service untouched.
+
+Updates wait up to **20 minutes** by default for authenticated RCON and Minecraft status
+responses, followed by 30 seconds of stable readiness. A crash, restart loop, failed apply
+or startup timeout triggers automatic revert. A successful systemd start alone is not
+readiness. When updating a stopped instance, this validation happens on its next
+`hopper start`; direct systemd starts are blocked until that validation is requested.
+
+`revert` restores the selected backup offline into a fresh directory, verifies it, and
+replaces the installation without overlaying newer mod files. It restores the matching
+world, lock, launcher and runtime, pins the restored version where the provider supports
+pins, and turns scheduled updates off. Collections and file/URL sources have no version
+pin; their updates are paused. Restart schedules are retained. A running server is
+restarted and checked; a stopped server stays stopped. Operator cancellation prevents
+automatic restart. **World progress since the snapshot is lost.**
+
+The displaced installation is removed after successful recovery. If recovery is
+interrupted or fails, the backup and displaced files are retained, ordinary starts are
+blocked, and `hopper repair NAME` resumes recovery without registry access. Backups
+needed for active recovery are not pruned. Automatic recovery covers the update and
+initial startup window; use manual revert for problems found later during gameplay.
+
+Use `--scope system` for system instances. `status --json` includes retention, backups,
+maintenance progress and the last outcome; `backups --json` lists restore points, and
+`update --json` / `revert --json` report the outcome and any error as JSON.
 
 ## Onboard an existing server, world and edited configs
 
@@ -192,7 +251,8 @@ Backups are retained for manual recovery; `hopper repair NAME` retries interrupt
 baseline adoption/service setup. Never start the old copy while migration is pending.
 
 Updates reconcile the installed baseline, current files and new pack: untracked files
-are never deleted; edited configs win and incoming versions appear as `.new`.
+are never deleted; conflicting edits are reviewed before applying. Existing `.new`
+sidecars from earlier installations still need review before maintenance or startup.
 Review and merge `.new` files before starting a major pack upgrade: old or
 server-generated configs can reference items removed by the new version.
 Starts and maintenance restarts are refused while any `.new` file remains in the

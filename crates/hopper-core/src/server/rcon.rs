@@ -39,14 +39,24 @@ pub struct Rcon {
 impl Rcon {
     /// Connect and authenticate.
     pub fn connect(addr: impl ToSocketAddrs, password: &str) -> Result<Self, RconError> {
+        Self::connect_timeout(addr, password, Duration::from_secs(30))
+    }
+
+    /// Bound both connection and command reads for maintenance readiness probes.
+    pub fn connect_timeout(
+        addr: impl ToSocketAddrs,
+        password: &str,
+        timeout: Duration,
+    ) -> Result<Self, RconError> {
         let addr = addr
             .to_socket_addrs()
             .map_err(RconError::Connect)?
             .next()
             .ok_or_else(|| RconError::Connect(std::io::ErrorKind::NotFound.into()))?;
-        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        let stream = TcpStream::connect_timeout(&addr, timeout.min(Duration::from_secs(5)))
             .map_err(RconError::Connect)?;
-        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
         let mut rcon = Self { stream, next_id: 1 };
 
         let id = rcon.send(TYPE_AUTH, password)?;

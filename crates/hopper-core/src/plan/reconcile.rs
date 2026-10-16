@@ -358,7 +358,7 @@ pub fn classify(t: &Triple<'_>, pol: &ConflictPolicy) -> Decision {
             };
 
             // An edit we already acknowledged: preserve silently so we do not nag every run.
-            if l.is_known_edit(dd) {
+            if l.is_known_edit(dd) && l.digest == w.content {
                 return Decision::Preserve {
                     lock: l.digest.clone(),
                     on_disk: dd.clone(),

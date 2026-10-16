@@ -99,6 +99,8 @@ mod tests {
             vec!["repair", "world"],
             vec!["check", "world"],
             vec!["update", "world"],
+            vec!["backups", "world"],
+            vec!["revert", "world"],
             vec!["configure", "world", "--warn", "60"],
             vec!["start", "world"],
             vec!["stop", "world"],

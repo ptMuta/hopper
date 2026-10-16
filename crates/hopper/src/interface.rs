@@ -294,6 +294,12 @@ pub enum Action {
         restart: Option<String>,
         #[arg(long)]
         warn: Option<u32>,
+        /// Number of verified pre-update backups to retain.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        backup_keep: Option<u32>,
+        /// Maximum startup validation time, in seconds.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        startup_timeout: Option<u64>,
     },
     List,
     Status {
@@ -304,6 +310,16 @@ pub enum Action {
     },
     Update {
         name: Option<String>,
+    },
+    /// List verified rolling update backups.
+    Backups {
+        name: Option<String>,
+    },
+    /// Restore a pre-update installation and world; pause scheduled updates.
+    Revert {
+        name: Option<String>,
+        #[arg(long)]
+        backup: Option<String>,
     },
     Start {
         name: Option<String>,
@@ -569,6 +585,8 @@ pub async fn run(app: &App) -> Result<i32> {
             update: None,
             restart: None,
             warn: None,
+            backup_keep: None,
+            startup_timeout: None,
         } if crate::prompt::enabled() && !crate::prompt::assume_defaults() => {
             let record = crate::resolve::instance(
                 app.scope,
@@ -591,6 +609,8 @@ pub async fn run(app: &App) -> Result<i32> {
                     update: settings.update,
                     restart: settings.restart,
                     warn: settings.warn,
+                    backup_keep: settings.backup_keep,
+                    startup_timeout: settings.startup_timeout,
                 },
             )
         }
@@ -641,6 +661,13 @@ async fn worker(app: &App, record: &Instance, operation: &str, args: &[String]) 
     );
     managed::check_worker_owner(record)?;
     match operation {
+        operation
+            if operation.starts_with("snapshot-")
+                || operation.starts_with("stage-")
+                || operation == "health" =>
+        {
+            crate::recovery::worker(record, operation, args, &crate::cache_dir()?)
+        }
         "start-check" => {
             crate::service::ensure_conflicts_resolved(&record.server())?;
             Ok(0)
@@ -655,7 +682,11 @@ async fn worker(app: &App, record: &Instance, operation: &str, args: &[String]) 
         "status" => crate::status(&record.server()),
         "repair" => {
             if record.server().join(".hopper/prepared.json").is_file() {
-                crate::apply_prepared(&record.server(), &record.cache()?)?;
+                ensure!(
+                    record.state == managed::State::Ready,
+                    "legacy interrupted staged update requires manual recovery; no verified update backup is recorded"
+                );
+                // Staging alone is not consent to apply, and repair must never bypass backup.
             }
             crate::migration::repair(record)?;
             Ok(0)
@@ -729,7 +760,18 @@ async fn worker(app: &App, record: &Instance, operation: &str, args: &[String]) 
             crate::migration::restore(record)?;
             Ok(0)
         }
-        "apply" => crate::apply_prepared(&record.server(), &crate::cache_dir()?),
+        "apply" => {
+            ensure!(
+                record.maintenance.as_ref().is_some_and(|m| m.phase
+                    == crate::recovery::Phase::Applying
+                    && record
+                        .backups
+                        .iter()
+                        .any(|s| s.id == m.backup_id && s.verified)),
+                "apply requires a verified pre-update snapshot; run hopper update"
+            );
+            crate::apply_prepared(&record.server(), &crate::cache_dir()?)
+        }
         "install" | "check" | "stage" => {
             let mut cli = engine(app, Some(record));
             cli.global.yes = true;
@@ -1173,6 +1215,8 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
         Status { name } => (name, Need::Look, "status"),
         Check { name } => (name, Need::Look, "check"),
         Update { name } => (name, Need::Change, "update"),
+        Backups { name } => (name, Need::Look, "backups"),
+        Revert { name, .. } => (name, Need::Change, "revert"),
         Start { name, .. } => (name, Need::Stopped, "start"),
         Stop { name } => (name, Need::Running, "stop"),
         Restart { name } => (name, Need::Running, "restart"),
@@ -1196,7 +1240,12 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
         }
         _ => vec![],
     };
-    if app.dry_run && !matches!(action, Status { .. } | Check { .. } | Logs { .. }) {
+    if app.dry_run
+        && !matches!(
+            action,
+            Status { .. } | Check { .. } | Logs { .. } | Backups { .. }
+        )
+    {
         println!("Would operate on {} ({:?})", name, app.scope);
         return Ok(10);
     }
@@ -1234,10 +1283,22 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
             update,
             restart,
             warn,
+            backup_keep,
+            startup_timeout,
             ..
         } => {
             managed::check_credentials(record.scope, &record.name, record.source.provider)?;
             let _guard = managed::operation_lock(&record)?;
+            ensure!(
+                record.maintenance.is_none(),
+                "finish or revert pending maintenance before changing configuration"
+            );
+            if let Some(keep) = backup_keep {
+                record.backup_keep = *keep as usize;
+            }
+            if let Some(timeout) = startup_timeout {
+                record.startup_timeout = *timeout;
+            }
             if let Some(major) = java_major {
                 ensure!(
                     record.source.provider == Provider::Gtnh && [8, 17, 21, 25].contains(major),
@@ -1269,6 +1330,9 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
             }
             managed::store_credentials(&record)?;
             managed::save(&record)?;
+            if backup_keep.is_some() {
+                crate::recovery::prune(&mut record)?;
+            }
             managed::install_units(&record)?;
             println!(
                 "Configured {}; pack files unchanged. Run hopper update {} to apply the target.",
@@ -1296,6 +1360,14 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
                     managed::property(&record, "ActiveState")
                         .unwrap_or_else(|_| "manager unavailable".into())
                 );
+                println!(
+                    "Backups: {} (keep {})\nStartup timeout: {}s\nMaintenance: {:?}\nLast outcome: {}",
+                    record.backups.len(),
+                    record.backup_keep,
+                    record.startup_timeout,
+                    record.maintenance.as_ref().map(|m| m.phase),
+                    record.last_maintenance.as_deref().unwrap_or("none")
+                );
                 let code = managed::invoke(&record, "status", &[])?;
                 println!(
                     "\nCheck for updates: hopper check {name} --scope {}",
@@ -1320,7 +1392,15 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
                     true,
                 )
             };
-            managed::maintain(&record, true, false, asking.then_some(&ask as _))
+            let result = managed::maintain(&record, true, false, asking.then_some(&ask as _));
+            crate::recovery::report(&record, &result)?;
+            result
+        }
+        Backups { .. } => crate::recovery::list(&record, app.json),
+        Revert { backup, .. } => {
+            let result = crate::recovery::revert(&mut record, backup.as_deref());
+            crate::recovery::report(&record, &result)?;
+            result
         }
         Restart { .. } => managed::maintain(&record, false, true, None),
         Start { .. } => {
@@ -1354,7 +1434,9 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
             Ok(0)
         }
         Repair { .. } => {
-            managed::check_credentials(record.scope, &record.name, record.source.provider)?;
+            if record.maintenance.is_none() {
+                managed::check_credentials(record.scope, &record.name, record.source.provider)?;
+            }
             let _guard = managed::operation_lock(&record)?;
             ensure!(
                 managed::property(&record, "ActiveState").or_else(|e| {
@@ -1366,6 +1448,10 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
                 })? == "inactive",
                 "stop the server before repair"
             );
+            if crate::recovery::repair(&mut record)? {
+                return Ok(0);
+            }
+            managed::check_credentials(record.scope, &record.name, record.source.provider)?;
             managed::store_credentials(&record)?;
             if record.scope == Scope::System {
                 managed::refresh_system_helper()?;
@@ -1450,6 +1536,35 @@ fn instance_action(app: &App, action: &Action) -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn backup_and_revert_flags_are_explicit_and_limits_are_positive() {
+        for args in [
+            vec!["hopper", "backups", "world", "--json"],
+            vec![
+                "hopper",
+                "revert",
+                "world",
+                "--backup",
+                "update-123",
+                "--scope",
+                "system",
+            ],
+            vec![
+                "hopper",
+                "configure",
+                "world",
+                "--backup-keep",
+                "2",
+                "--startup-timeout",
+                "1200",
+            ],
+        ] {
+            assert!(App::try_parse_from(args).is_ok());
+        }
+        for flag in ["--backup-keep", "--startup-timeout"] {
+            assert!(App::try_parse_from(["hopper", "configure", "world", flag, "0"]).is_err());
+        }
+    }
     #[test]
     fn network_verbs_accept_explicit_settings_without_firewall_flags() {
         for args in [

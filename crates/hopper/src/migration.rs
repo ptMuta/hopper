@@ -19,15 +19,21 @@ use crate::interface::{App, Provider, Scope};
 use crate::managed::{self, Instance};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct Entry {
-    digest: Option<Digest>,
-    size: u64,
+pub(crate) struct Entry {
+    pub(crate) digest: Option<Digest>,
+    pub(crate) size: u64,
     mode: u32,
     link: Option<PathBuf>,
 }
-type Manifest = BTreeMap<String, Entry>;
+pub(crate) type Manifest = BTreeMap<String, Entry>;
 
-fn available_bytes(path: &Path) -> Result<u64> {
+pub(crate) fn available_bytes(path: &Path) -> Result<u64> {
+    #[cfg(test)]
+    if let Some(fake) = crate::maintenance_test::get() {
+        if let Some(bytes) = fake.available_bytes() {
+            return Ok(bytes);
+        }
+    }
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
     let mut info = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -93,8 +99,12 @@ fn verify_removal_permissions(root: &Path) -> Result<()> {
     visit(root)
 }
 
-fn manifest(root: &Path) -> Result<Manifest> {
-    fn visit(root: &Path, dir: &Path, out: &mut Manifest) -> Result<()> {
+pub(crate) fn manifest(root: &Path) -> Result<Manifest> {
+    manifest_filtered(root, &[])
+}
+
+pub(crate) fn manifest_filtered(root: &Path, excluded: &[&str]) -> Result<Manifest> {
+    fn visit(root: &Path, dir: &Path, excluded: &[&str], out: &mut Manifest) -> Result<()> {
         for item in fs::read_dir(dir)? {
             let path = item?.path();
             let relative = path
@@ -102,6 +112,12 @@ fn manifest(root: &Path) -> Result<Manifest> {
                 .to_str()
                 .context("non-UTF8 migration path")?
                 .to_owned();
+            if excluded
+                .iter()
+                .any(|p| relative == *p || relative.starts_with(&format!("{p}/")))
+            {
+                continue;
+            }
             RelPath::parse(&relative)?;
             let meta = fs::symlink_metadata(&path)?;
             let link = if meta.file_type().is_symlink() {
@@ -133,17 +149,17 @@ fn manifest(root: &Path) -> Result<Manifest> {
                 },
             );
             if meta.is_dir() {
-                visit(root, &path, out)?;
+                visit(root, &path, excluded, out)?;
             }
         }
         Ok(())
     }
     let mut out = BTreeMap::new();
-    visit(root, root, &mut out)?;
+    visit(root, root, excluded, &mut out)?;
     Ok(out)
 }
 
-fn verify_archive(path: &Path, expected: &Manifest) -> Result<()> {
+pub(crate) fn verify_archive(path: &Path, expected: &Manifest) -> Result<()> {
     let mut archive = tar::Archive::new(GzDecoder::new(File::open(path)?));
     let mut actual = BTreeMap::new();
     for entry in archive.entries()? {
@@ -220,9 +236,13 @@ fn verify_archive(path: &Path, expected: &Manifest) -> Result<()> {
 }
 
 fn backup(root: &Path, path: &Path) -> Result<Manifest> {
+    backup_filtered(root, path, &[])
+}
+
+pub(crate) fn backup_filtered(root: &Path, path: &Path, excluded: &[&str]) -> Result<Manifest> {
     let root = root.canonicalize()?;
     ensure!(
-        !path.starts_with(&root),
+        !path.starts_with(&root) || excluded.iter().any(|p| path.starts_with(root.join(p))),
         "backup must be outside the source installation"
     );
     let parent = path.parent().context("backup needs a parent directory")?;
@@ -231,10 +251,13 @@ fn backup(root: &Path, path: &Path) -> Result<Manifest> {
         .canonicalize()?
         .join(path.file_name().context("backup needs a filename")?);
     ensure!(
-        !destination.starts_with(&root),
+        !destination.starts_with(&root)
+            || excluded
+                .iter()
+                .any(|p| destination.starts_with(root.join(p))),
         "backup must be outside the source installation"
     );
-    let before = manifest(&root)?;
+    let before = manifest_filtered(&root, excluded)?;
     let required = before
         .values()
         .map(|e| e.size)
@@ -258,12 +281,18 @@ fn backup(root: &Path, path: &Path) -> Result<Manifest> {
     let gzip = GzEncoder::new(file, Compression::default());
     let mut builder = tar::Builder::new(gzip);
     builder.follow_symlinks(false);
-    builder.append_dir_all(".", &root)?;
+    for name in before.keys() {
+        builder.append_path_with_name(root.join(name), name)?;
+    }
     let gzip = builder.into_inner()?;
     let file = gzip.finish()?;
     file.sync_all()?;
+    #[cfg(test)]
+    if let Some(fake) = crate::maintenance_test::get() {
+        fake.after_archive(&root)?;
+    }
     ensure!(
-        manifest(&root)? == before,
+        manifest_filtered(&root, excluded)? == before,
         "source changed during backup; stop the server and retry"
     );
     verify_archive(path, &before)?;

@@ -32,6 +32,7 @@ pub enum Mode {
 struct Interaction {
     mode: Mode,
     yes: bool,
+    json: bool,
 }
 
 static INTERACTION: OnceLock<Interaction> = OnceLock::new();
@@ -78,7 +79,7 @@ pub fn init(no_input: bool, json: bool, yes: bool, hidden: bool) {
     } else {
         Mode::Term
     };
-    let _ = INTERACTION.set(Interaction { mode, yes });
+    let _ = INTERACTION.set(Interaction { mode, yes, json });
 }
 
 pub fn mode() -> Mode {
@@ -92,6 +93,10 @@ pub fn enabled() -> bool {
 /// `-y`: take the default of every question that has one.
 pub fn assume_defaults() -> bool {
     INTERACTION.get().is_some_and(|i| i.yes)
+}
+
+pub fn json_output() -> bool {
+    INTERACTION.get().is_some_and(|i| i.json)
 }
 
 /// Ctrl-C or Esc at a prompt. Nothing has changed; exit 130.

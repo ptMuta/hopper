@@ -29,12 +29,16 @@ mod engine_tests;
 mod gtnh;
 mod instances;
 mod interface;
+#[cfg(test)]
+mod maintenance_test;
 mod managed;
 mod migration;
 mod network;
 mod prompt;
+mod recovery;
 mod render;
 mod resolve;
+mod review;
 mod runtime;
 mod selfupdate;
 mod service;
@@ -918,6 +922,7 @@ async fn finish_install(
             gtnh: cli.install.native_java.is_some(),
             previous: existing.map(|l| l.to_json()).transpose()?,
             committed: None,
+            choices: Vec::new(),
         };
         hfs::write_atomic(
             &root.join(".hopper/prepared.json"),
@@ -1013,6 +1018,8 @@ struct PreparedInstall {
     previous: Option<String>,
     #[serde(default)]
     committed: Option<String>,
+    #[serde(default)]
+    choices: Vec<review::Choice>,
 }
 
 /// Apply the staged snapshot without a second network resolution. Reconcile after
@@ -1023,6 +1030,22 @@ fn apply_prepared(root: &Path, cache: &Path) -> Result<i32> {
     let mut previous = read_lockfile(root)?;
     let current = previous.as_ref().map(|l| l.to_json()).transpose()?;
     let already_committed = prepared.committed.is_some() && current == prepared.committed;
+    if already_committed {
+        for choice in &prepared.choices {
+            let actual = hfs::hash_file(&choice.path.resolve_under(root))?.1;
+            let expected = if choice.keep {
+                &choice.local
+            } else {
+                &choice.incoming
+            };
+            anyhow::ensure!(
+                actual == *expected
+                    || (choice.path.as_str() == ".hopper-launch.sh" && actual == choice.local),
+                "file changed after commit: {}; revert or review again",
+                choice.path
+            );
+        }
+    }
     anyhow::ensure!(
         current == prepared.previous || already_committed,
         "lockfile changed after staging; recheck instead of applying a stale snapshot"
@@ -1084,18 +1107,22 @@ fn apply_prepared(root: &Path, cache: &Path) -> Result<i32> {
     if let Some(lock) = &previous {
         paths.extend(lock.files.iter().map(|f| f.path.clone()));
     }
-    let decisions = reconcile(
+    let mut decisions = reconcile(
         previous.as_ref(),
         &scan(root, &paths),
         &desired,
         &world_policy(root)?,
     );
-    let next = next_lockfile(
+    if !already_committed {
+        review::resolve(root, &prepared, &mut decisions)?;
+    }
+    let mut next = next_lockfile(
         previous.as_ref(),
         &decisions,
         &prepared.entries,
         prepared.template.clone(),
     );
+    review::record_choices(&prepared, &mut next);
     if !already_committed {
         prepared.committed = Some(next.to_json()?);
         hfs::write_atomic(
@@ -1115,16 +1142,36 @@ fn apply_prepared(root: &Path, cache: &Path) -> Result<i32> {
         )?;
     }
     if let Some(start) = prepared.start {
-        let start = if edited {
+        let start = if let Some(choice) = prepared
+            .choices
+            .iter()
+            .find(|c| c.path.as_str() == ".hopper-launch.sh")
+        {
+            if choice.keep {
+                None
+            } else {
+                let content = match start {
+                    StartScript::Write { content, .. } | StartScript::KeepEdited { content } => {
+                        content
+                    }
+                };
+                Some(StartScript::Write {
+                    digest: choice.incoming.clone(),
+                    content,
+                })
+            }
+        } else if edited {
             match start {
                 StartScript::Write { content, .. } | StartScript::KeepEdited { content } => {
-                    StartScript::KeepEdited { content }
+                    Some(StartScript::KeepEdited { content })
                 }
             }
         } else {
-            start
+            Some(start)
         };
-        write_start_script(root, &start, false, prepared.managed, prepared.gtnh)?;
+        if let Some(start) = start {
+            write_start_script(root, &start, false, prepared.managed, prepared.gtnh)?;
+        }
     }
     std::fs::remove_file(root.join(".hopper/prepared.json"))?;
     Ok(exit::OK)
@@ -2000,6 +2047,7 @@ mod tests {
             gtnh: false,
             previous: Some(old.to_json().unwrap()),
             committed: committed.then(|| next.to_json().unwrap()),
+            choices: Vec::new(),
         };
         let current_script = if edited {
             "#!/bin/sh\n# operator edit\nexec true\n"

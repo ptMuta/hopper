@@ -1060,6 +1060,8 @@ pub struct Settings {
     pub update: Option<String>,
     pub restart: Option<String>,
     pub warn: Option<u32>,
+    pub backup_keep: Option<u32>,
+    pub startup_timeout: Option<u64>,
 }
 
 impl Settings {
@@ -1129,6 +1131,8 @@ pub async fn configure(record: &Instance) -> Result<Settings> {
     let mut update = record.update.clone();
     let mut restart = record.restart.clone();
     let mut warn = record.warn;
+    let mut backup_keep = record.backup_keep as u32;
+    let mut startup_timeout = record.startup_timeout;
     let mut java = record.runtime.java_major;
     let mut cursor = 0;
     loop {
@@ -1157,6 +1161,14 @@ pub async fn configure(record: &Instance) -> Result<Settings> {
         items.push(
             Item::new("Warn", "warn").hint(was(format!("{}s", record.warn), format!("{warn}s"))),
         );
+        items.push(
+            Item::new("Backups kept", "backup_keep")
+                .hint(was(record.backup_keep.to_string(), backup_keep.to_string())),
+        );
+        items.push(Item::new("Startup timeout", "startup_timeout").hint(was(
+            format!("{}s", record.startup_timeout),
+            format!("{startup_timeout}s"),
+        )));
         if gtnh {
             let show = |j: Option<u32>| j.map_or("pack default".to_owned(), |j| j.to_string());
             items.push(
@@ -1167,6 +1179,8 @@ pub async fn configure(record: &Instance) -> Result<Settings> {
             + usize::from(update != record.update)
             + usize::from(restart != record.restart)
             + usize::from(warn != record.warn)
+            + usize::from(backup_keep as usize != record.backup_keep)
+            + usize::from(startup_timeout != record.startup_timeout)
             + usize::from(java != record.runtime.java_major);
         items.push(Item::new("Save", "save").hint(match changes {
             0 => "nothing changed".to_owned(),
@@ -1207,6 +1221,32 @@ pub async fn configure(record: &Instance) -> Result<Settings> {
                     1
                 })
             }
+            "backup_keep" => prompt::text("Backups kept", Some(&backup_keep.to_string()), &|s| {
+                anyhow::ensure!(
+                    s.parse::<u32>().is_ok_and(|n| n > 0),
+                    "enter a positive number"
+                );
+                Ok(())
+            })
+            .map(|s| {
+                backup_keep = s.parse().expect("validated");
+                1
+            }),
+            "startup_timeout" => prompt::text(
+                "Startup timeout (s)",
+                Some(&startup_timeout.to_string()),
+                &|s| {
+                    anyhow::ensure!(
+                        s.parse::<u64>().is_ok_and(|n| n > 0),
+                        "enter positive seconds"
+                    );
+                    Ok(())
+                },
+            )
+            .map(|s| {
+                startup_timeout = s.parse().expect("validated");
+                1
+            }),
             _ => {
                 let majors: Vec<Item<u32>> = [8, 17, 21, 25]
                     .iter()
@@ -1241,6 +1281,22 @@ pub async fn configure(record: &Instance) -> Result<Settings> {
     show("Update", record.update.clone(), update.clone());
     show("Restart", record.restart.clone(), restart.clone());
     show("Warn", format!("{}s", record.warn), format!("{warn}s"));
+    show(
+        "Backups kept",
+        record.backup_keep.to_string(),
+        backup_keep.to_string(),
+    );
+    show(
+        "Startup timeout",
+        record.startup_timeout.to_string(),
+        startup_timeout.to_string(),
+    );
+    if backup_keep as usize != record.backup_keep {
+        settings.backup_keep = Some(backup_keep);
+    }
+    if startup_timeout != record.startup_timeout {
+        settings.startup_timeout = Some(startup_timeout);
+    }
     if new_target != old_target {
         match target {
             (_, Some(pin)) => settings.pack_version = Some(pin),

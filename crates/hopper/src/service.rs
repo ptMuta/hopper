@@ -39,6 +39,14 @@ pub fn unit_dir() -> Result<PathBuf> {
 /// Sidecars are deliberately not cleared by updates: the operator must review
 /// the incoming version, merge or reject it, then remove the `.new` file.
 pub fn ensure_conflicts_resolved(dir: &Path) -> Result<()> {
+    crate::recovery::start_gate(
+        dir,
+        if SYSTEM_SCOPE.load(Ordering::Relaxed) {
+            crate::interface::Scope::System
+        } else {
+            crate::interface::Scope::User
+        },
+    )?;
     fn visit(root: &Path, dir: &Path, conflicts: &mut Vec<PathBuf>) -> Result<()> {
         for entry in std::fs::read_dir(dir)
             .with_context(|| format!("checking unresolved conflicts in {}", dir.display()))?

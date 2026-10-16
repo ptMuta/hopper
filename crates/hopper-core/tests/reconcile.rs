@@ -364,6 +364,23 @@ fn an_acknowledged_edit_stops_being_reported() {
 }
 
 #[test]
+fn acknowledged_edit_is_reviewed_again_when_upstream_changes() {
+    let mut l = locked("config/x.toml", d(1));
+    l.user_modified = Some(d(5));
+    let w = DesiredFile {
+        provenance: config_provenance(),
+        ..wanted("config/x.toml", d(2))
+    };
+    assert!(matches!(
+        decide(Some(&l), Some(&on_disk(d(5))), Some(&w)),
+        Decision::Conflict {
+            reason: ConflictReason::LocalModification,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn modified_and_upgraded_is_a_real_conflict() {
     let l = locked("mods/a.jar", d(1));
     let w = wanted("mods/a.jar", d(2));

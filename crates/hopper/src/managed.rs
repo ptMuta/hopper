@@ -51,6 +51,16 @@ pub struct Instance {
     pub listen_address: Option<String>,
     #[serde(default)]
     pub installed_version: Option<String>,
+    #[serde(default = "crate::recovery::default_keep")]
+    pub backup_keep: usize,
+    #[serde(default = "crate::recovery::default_timeout")]
+    pub startup_timeout: u64,
+    #[serde(default)]
+    pub backups: Vec<crate::recovery::Snapshot>,
+    #[serde(default)]
+    pub maintenance: Option<crate::recovery::Transaction>,
+    #[serde(default)]
+    pub last_maintenance: Option<String>,
 }
 
 impl Instance {
@@ -77,6 +87,11 @@ impl Instance {
             rcon_port: None,
             listen_address: None,
             installed_version: None,
+            backup_keep: crate::recovery::default_keep(),
+            startup_timeout: crate::recovery::default_timeout(),
+            backups: Vec::new(),
+            maintenance: None,
+            last_maintenance: None,
         })
     }
     pub fn server(&self) -> PathBuf {
@@ -89,6 +104,10 @@ impl Instance {
         format!("hopper-{}.service", self.name)
     }
     pub fn cache(&self) -> Result<PathBuf> {
+        #[cfg(test)]
+        if let Some(fake) = crate::maintenance_test::get() {
+            return Ok(fake.root.join("cache"));
+        }
         Ok(match self.scope {
             Scope::User => crate::cache_dir()?.join("instances").join(&self.name),
             Scope::System => PathBuf::from("/var/cache/hopper").join(&self.name),
@@ -113,6 +132,10 @@ pub fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 pub fn data_root(scope: Scope) -> Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(fake) = crate::maintenance_test::get() {
+        return Ok(fake.root.join("instances"));
+    }
     Ok(match scope {
         Scope::User => std::env::var_os("HOPPER_INSTANCE_ROOT")
             .map(PathBuf::from)
@@ -121,6 +144,10 @@ pub fn data_root(scope: Scope) -> Result<PathBuf> {
     })
 }
 fn config_root(scope: Scope) -> Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(fake) = crate::maintenance_test::get() {
+        return Ok(fake.root.join("config"));
+    }
     Ok(match scope {
         Scope::User => std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -154,8 +181,47 @@ pub fn load(scope: Scope, name: &str) -> Result<Instance> {
             && record.root == data_root(scope)?.join(name),
         "invalid instance record"
     );
+    ensure!(
+        record.backup_keep > 0 && record.startup_timeout > 0,
+        "backup retention and startup timeout must be positive"
+    );
     record.source.validate()?;
     Ok(record)
+}
+
+/// Service units already carry an explicit server path. Their manager need not inherit
+/// the HOPPER_INSTANCE_ROOT environment used when the instance was created.
+pub(crate) fn record_for_server(scope: Scope, server: &Path) -> Result<Option<Instance>> {
+    let Some(root) = server.parent() else {
+        return Ok(None);
+    };
+    let Some(name) = root.file_name().and_then(|n| n.to_str()) else {
+        return Ok(None);
+    };
+    if validate_name(name).is_err() {
+        return Ok(None);
+    }
+    let path = record_path(scope, name)?;
+    let Some(bytes) = hfs::read_optional(&path)? else {
+        ensure!(
+            root.parent() != Some(data_root(scope)?.as_path()),
+            "managed instance record missing; start refused"
+        );
+        return Ok(None);
+    };
+    if scope == Scope::System {
+        trusted(&path, false)?;
+    }
+    let record: Instance = serde_json::from_slice(&bytes)?;
+    ensure!(
+        record.format == 1
+            && record.name == name
+            && record.scope == scope
+            && record.server() == server,
+        "instance record does not match service directory"
+    );
+    record.source.validate()?;
+    Ok(Some(record))
 }
 pub fn save(record: &Instance) -> Result<()> {
     let path = record_path(record.scope, &record.name)?;
@@ -434,12 +500,20 @@ pub fn ctl(scope: Scope) -> Command {
     }
     cmd
 }
-fn checked(cmd: &mut Command, action: &str) -> Result<()> {
+pub(crate) fn checked(cmd: &mut Command, action: &str) -> Result<()> {
+    #[cfg(test)]
+    if let Some(fake) = crate::maintenance_test::get() {
+        return fake.control(cmd, action);
+    }
     let status = cmd.status().with_context(|| action.to_owned())?;
     ensure!(status.success(), "{action} failed ({status})");
     Ok(())
 }
 pub fn property(record: &Instance, property: &str) -> Result<String> {
+    #[cfg(test)]
+    if let Some(fake) = crate::maintenance_test::get() {
+        return fake.property(property);
+    }
     let out = ctl(record.scope)
         .args(["show", &record.unit(), "--property", property, "--value"])
         .output()?;
@@ -512,6 +586,9 @@ fn worker_command(record: &Instance, operation: &str, args: &[String]) -> Result
         &record.name,
         operation,
     ]);
+    if crate::prompt::json_output() {
+        cmd.arg("--json");
+    }
     if !args.is_empty() {
         cmd.arg("--").args(args);
     }
@@ -533,6 +610,18 @@ fn worker_command(record: &Instance, operation: &str, args: &[String]) -> Result
     Ok(cmd)
 }
 pub fn invoke(record: &Instance, operation: &str, args: &[String]) -> Result<i32> {
+    #[cfg(test)]
+    if let Some(fake) = crate::maintenance_test::get() {
+        return fake.invoke(record, operation, args);
+    }
+    if crate::prompt::json_output() {
+        let output = worker_command(record, operation, args)?
+            .output()
+            .context("running instance worker")?;
+        use std::io::Write;
+        std::io::stderr().write_all(&output.stderr)?;
+        return Ok(output.status.code().unwrap_or(1));
+    }
     let status = worker_command(record, operation, args)?
         .status()
         .context("running instance worker")?;
@@ -542,7 +631,34 @@ pub fn capture(record: &Instance, operation: &str) -> Result<String> {
     capture_args(record, operation, &[])
 }
 
+/// Review payloads can exceed the operating system's per-argument size limit.
+pub(crate) fn invoke_input(record: &Instance, operation: &str, bytes: &[u8]) -> Result<i32> {
+    #[cfg(test)]
+    if let Some(fake) = crate::maintenance_test::get() {
+        return fake.invoke(record, operation, &[std::str::from_utf8(bytes)?.to_owned()]);
+    }
+    use std::io::Write;
+    let mut command = worker_command(record, operation, &[])?;
+    command.stdin(std::process::Stdio::piped());
+    if crate::prompt::json_output() {
+        command.stdout(std::process::Stdio::null());
+    }
+    let mut child = command.spawn().context("starting instance worker")?;
+    let written = child
+        .stdin
+        .take()
+        .context("worker stdin unavailable")
+        .and_then(|mut stdin| stdin.write_all(bytes).context("sending worker input"));
+    let status = child.wait()?;
+    written?;
+    Ok(status.code().unwrap_or(1))
+}
+
 pub fn capture_args(record: &Instance, operation: &str, args: &[String]) -> Result<String> {
+    #[cfg(test)]
+    if let Some(fake) = crate::maintenance_test::get() {
+        return fake.capture(record, operation, args);
+    }
     let output = worker_command(record, operation, args)?.output()?;
     ensure!(
         output.status.success(),
@@ -647,6 +763,10 @@ fn hardening(writable: &[PathBuf]) -> Result<Vec<String>> {
 }
 
 fn unit_dir(scope: Scope) -> Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(fake) = crate::maintenance_test::get() {
+        return Ok(fake.root.join("units"));
+    }
     if scope == Scope::System {
         Ok(PathBuf::from("/etc/systemd/system"))
     } else {
@@ -802,9 +922,23 @@ pub fn server_unit(record: &Instance, executable: &Path) -> Result<String> {
 }
 
 pub fn install_units(record: &Instance) -> Result<()> {
+    install_units_impl(record, true)
+}
+
+pub(crate) fn install_units_offline(record: &Instance) -> Result<()> {
+    install_units_impl(record, false)
+}
+
+fn install_units_impl(record: &Instance, refresh_credentials: bool) -> Result<()> {
+    #[cfg(test)]
+    if let Some(fake) = crate::maintenance_test::get() {
+        return fake.install_units(record);
+    }
     validate_schedule(&record.update)?;
     validate_schedule(&record.restart)?;
-    store_credentials(record)?;
+    if refresh_credentials {
+        store_credentials(record)?;
+    }
     let root = unit_dir(record.scope)?;
     if record.scope == Scope::System {
         ensure!(is_root(), "root required");
@@ -837,7 +971,7 @@ pub fn install_units(record: &Instance) -> Result<()> {
                 if restart { "--restart" } else { "" }
             );
             if record.scope == Scope::System {
-                maintenance.push_str("ProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictAddressFamilies=AF_UNIX\nCapabilityBoundingSet=\nReadWritePaths=/run/hopper /etc/hopper/instances\n");
+                maintenance.push_str("ProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictAddressFamilies=AF_UNIX\nCapabilityBoundingSet=\nReadWritePaths=/run/hopper /etc/hopper/instances /etc/systemd/system /usr/local/libexec\n");
             }
             let timer = format!(
                 "[Unit]\nDescription=Hopper {kind} schedule {}\n\n[Timer]\nOnCalendar={}\nPersistent={}\nRandomizedDelaySec={}\n\n[Install]\nWantedBy=timers.target\n",
@@ -897,20 +1031,70 @@ pub fn start(record: &mut Instance) -> Result<()> {
         record.state == State::Ready,
         "instance is not ready; run repair or onboard it again"
     );
+    let validate = record
+        .maintenance
+        .as_ref()
+        .is_some_and(|m| m.phase == crate::recovery::Phase::AwaitingStart);
     ensure!(
-        invoke(record, "start-check", &[])? == 0,
-        "start refused: resolve the .new conflicts listed above before starting"
+        record.maintenance.is_none() || validate,
+        "interrupted maintenance; run repair"
     );
-    if record.scope == Scope::System {
-        ensure!(is_root(), "system start requires root");
+    if validate {
+        let token = fs::read(cancellation(record)?).ok();
+        let maintenance = record
+            .maintenance
+            .as_mut()
+            .context("missing startup validation")?;
+        maintenance.phase = crate::recovery::Phase::Validating;
+        maintenance.was_running = true;
+        maintenance.cancellation = token;
+        save(record)?;
     }
-    checked(
-        ctl(record.scope).args(["enable", "--now", &record.unit()]),
-        "starting instance",
-    )?;
-    record.started = true;
-    save(record)?;
-    activate_timers(record)?;
+    let outcome: Result<()> = (|| {
+        if validate {
+            checked(
+                ctl(record.scope).args(["reset-failed", &record.unit()]),
+                "resetting startup failures",
+            )?;
+        }
+        ensure!(
+            invoke(record, "start-check", &[])? == 0,
+            "start refused: resolve the .new conflicts listed above before starting"
+        );
+        if record.scope == Scope::System {
+            ensure!(is_root(), "system start requires root");
+        }
+        checked(
+            ctl(record.scope).args(["enable", "--now", &record.unit()]),
+            "starting instance",
+        )?;
+        record.started = true;
+        save(record)?;
+        activate_timers(record)?;
+        if validate {
+            crate::recovery::wait_ready(record)?;
+            crate::recovery::complete(record, "update succeeded; startup verified")?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = outcome {
+        if validate {
+            checked(
+                ctl(record.scope).args(["stop", &record.unit()]),
+                "stopping failed update",
+            )?;
+            let id = record
+                .maintenance
+                .as_ref()
+                .context("missing recovery backup")?
+                .backup_id
+                .clone();
+            crate::recovery::rollback(record, &id, true)
+                .context("automatic revert failed; run repair")?;
+            return Err(error.context("startup failed; pre-update installation and world restored"));
+        }
+        return Err(error);
+    }
     if record.scope == Scope::User {
         println!(
             "User service enabled. For startup without a login, enable lingering with loginctl enable-linger."
@@ -964,7 +1148,7 @@ impl Drop for OperationLock {
         }
     }
 }
-fn cancellation(record: &Instance) -> Result<PathBuf> {
+pub(crate) fn cancellation(record: &Instance) -> Result<PathBuf> {
     Ok(lock_root(record.scope)?.join(format!("{}.cancel", record.name)))
 }
 pub fn stop(record: &Instance) -> Result<()> {
@@ -987,7 +1171,13 @@ pub fn maintain(
     restart: bool,
     confirm: Option<Confirm>,
 ) -> Result<i32> {
+    let mut owned = record.clone();
+    let record = &mut owned;
     ensure!(record.state == State::Ready, "instance is not ready");
+    ensure!(
+        record.maintenance.is_none(),
+        "pending update validation or recovery; start, revert, or repair first"
+    );
     if update {
         check_credentials(record.scope, &record.name, record.source.provider)?;
     }
@@ -1005,15 +1195,17 @@ pub fn maintain(
     };
     let running = property(record, "ActiveState")? == "active";
     if !changed && !(restart && running) {
-        println!("{}: no maintenance needed", record.name);
+        record.last_maintenance = Some("no maintenance needed".into());
+        save(record)?;
+        if !crate::prompt::json_output() {
+            println!("{}: no maintenance needed", record.name);
+        }
         return Ok(0);
     }
-    if running {
-        ensure!(
-            invoke(record, "start-check", &[])? == 0,
-            "maintenance refused: unresolved .new conflicts; service untouched"
-        );
-    }
+    ensure!(
+        invoke(record, "start-check", &[])? == 0,
+        "maintenance refused: unresolved conflicts or incomplete recovery; service untouched"
+    );
     if changed {
         let code = invoke(record, "stage", &[])?;
         ensure!(
@@ -1021,6 +1213,17 @@ pub fn maintain(
             "staging failed ({code}); service untouched"
         );
         changed = code == 10;
+        if changed {
+            if !crate::recovery::review(record)? {
+                record.last_maintenance = Some("update skipped: unresolved file conflicts".into());
+                save(record)?;
+                return Ok(crate::cli::exit::CHANGES_PENDING);
+            }
+            ensure!(
+                invoke(record, "snapshot-preflight", &[])? == 0,
+                "backup preflight failed; service untouched"
+            );
+        }
     }
     if !changed && !restart {
         return Ok(0);
@@ -1093,20 +1296,44 @@ pub fn maintain(
         "server started during maintenance; no changes applied"
     );
     if changed {
-        let mut pending = record.clone();
-        pending.state = State::Pending;
-        save(&pending)?;
-        let code = invoke(record, "apply", &[])?;
-        ensure!(
-            code == 0,
-            "update failed ({code}); server remains stopped; run repair"
-        );
-    }
-    if changed {
-        let mut updated = record.clone();
-        refresh(&mut updated)?;
-        updated.state = State::Ready;
-        save(&updated)?;
+        if invoke(record, "stage-validate", &[])? != 0 {
+            if running && !cancelled() {
+                checked(
+                    ctl(record.scope).args(["start", &record.unit()]),
+                    "restarting unchanged server",
+                )?;
+            }
+            bail!("files changed after review; update not applied; rerun update");
+        }
+        if let Err(error) = crate::recovery::begin(record, running, token.clone()) {
+            if record.maintenance.is_some() {
+                crate::recovery::repair(record)
+                    .context("backup failed; recovery also failed; run repair")?;
+            }
+            return Err(error.context("update aborted before apply"));
+        }
+        let result: Result<()> = (|| {
+            ensure!(!cancelled(), "maintenance cancelled before apply");
+            ensure!(invoke(record, "apply", &[])? == 0, "applying update failed");
+            refresh(record)?;
+            crate::recovery::finish(record, running)
+        })();
+        if let Err(error) = result {
+            checked(
+                ctl(record.scope).args(["stop", &record.unit()]),
+                "stopping failed update",
+            )?;
+            let id = record
+                .maintenance
+                .as_ref()
+                .context("missing recovery snapshot")?
+                .backup_id
+                .clone();
+            crate::recovery::rollback(record, &id, running)
+                .context("automatic revert failed; server stopped; run repair")?;
+            return Err(error.context("update failed; pre-update installation and world restored"));
+        }
+        return Ok(0);
     }
     if running && !cancelled() {
         ensure!(

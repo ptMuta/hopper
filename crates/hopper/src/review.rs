@@ -18,6 +18,8 @@ pub struct Choice {
     pub local: Digest,
     pub incoming: Digest,
     pub keep: bool,
+    #[serde(default)]
+    pub merged: Option<Digest>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -25,6 +27,8 @@ pub struct Conflict {
     pub choice: Choice,
     pub diff: String,
     pub reviewed: bool,
+    #[serde(default)]
+    pub removed: bool,
 }
 
 fn load(root: &Path) -> Result<PreparedInstall> {
@@ -34,7 +38,7 @@ fn load(root: &Path) -> Result<PreparedInstall> {
 }
 
 fn decisions(root: &Path, prepared: &PreparedInstall) -> Result<Vec<(RelPath, Decision)>> {
-    let lock = crate::read_lockfile(root)?;
+    let mut lock = crate::read_lockfile(root)?;
     let mut desired = DesiredSet::default();
     for file in prepared.entries.values() {
         desired.insert(DesiredFile {
@@ -50,9 +54,18 @@ fn decisions(root: &Path, prepared: &PreparedInstall) -> Result<Vec<(RelPath, De
     if let Some(lock) = &lock {
         paths.extend(lock.files.iter().map(|f| f.path.clone()));
     }
+    let disk = crate::scan(root, &paths);
+    // Adoption records ownership, not customization. Compare actual bytes to baseline.
+    if let Some(lock) = &mut lock {
+        for file in &mut lock.files {
+            if disk.get(&file.path).and_then(|d| d.digest.as_ref()) == Some(&file.digest) {
+                file.state = hopper_core::model::FileState::Managed;
+            }
+        }
+    }
     Ok(reconcile(
         lock.as_ref(),
-        &crate::scan(root, &paths),
+        &disk,
         &desired,
         &crate::world_policy(root)?,
     ))
@@ -124,12 +137,45 @@ fn diff(path: &RelPath, local: &[u8], incoming: &[u8]) -> String {
 pub fn conflicts(root: &Path, cache: &Path) -> Result<Vec<Conflict>> {
     let prepared = load(root)?;
     let store = BlobStore::new(cache);
+    let lock = crate::read_lockfile(root)?;
     let mut out = Vec::new();
     for (path, decision) in decisions(root, &prepared)? {
         ensure!(
             !matches!(decision, Decision::Reject { .. }),
             "update rejected at {path}: {decision:?}"
         );
+        if matches!(decision, Decision::Untrack { .. }) {
+            if let Some(base) = lock.as_ref().and_then(|l| l.file(&path)) {
+                if let Ok((_, local)) = hfs::hash_file(&path.resolve_under(root)) {
+                    if local != base.digest {
+                        let bytes = std::fs::read(path.resolve_under(root))?;
+                        let base_bytes = store
+                            .get_verified(&base.digest)?
+                            .map(|b| std::fs::read(b.path))
+                            .transpose()?;
+                        let detail = base_bytes
+                            .as_ref()
+                            .map(|base| diff(&path, base, &bytes))
+                            .unwrap_or_else(|| format!("Customized {path}: {local}"));
+                        out.push(Conflict {
+                            choice: Choice {
+                                path,
+                                local,
+                                incoming: base.digest.clone(),
+                                keep: true,
+                                merged: None,
+                            },
+                            diff: format!(
+                                "{detail}\nIncoming release removes this customized file."
+                            ),
+                            reviewed: false,
+                            removed: true,
+                        });
+                    }
+                }
+            }
+            continue;
+        }
         if let Decision::Conflict {
             desired: Some(incoming),
             on_disk: Some(local),
@@ -145,15 +191,44 @@ pub fn conflicts(root: &Path, cache: &Path) -> Result<Vec<Conflict>> {
                 "file changed during review: {path}"
             );
             let incoming_bytes = std::fs::read(blob.path)?;
+            let baseline = lock.as_ref().and_then(|l| l.file(&path));
+            let base_bytes = baseline
+                .map(|f| store.get_verified(&f.digest))
+                .transpose()?
+                .flatten()
+                .map(|b| std::fs::read(b.path))
+                .transpose()?;
+            let merged_bytes = if baseline.is_some_and(|f| f.digest == incoming) {
+                Some(local_bytes.clone())
+            } else {
+                base_bytes
+                    .as_ref()
+                    .and_then(|base| crate::merge::three_way(base, &local_bytes, &incoming_bytes))
+            };
+            let keep = merged_bytes
+                .as_ref()
+                .is_none_or(|bytes| bytes == &local_bytes);
+            let merged = merged_bytes
+                .as_ref()
+                .filter(|bytes| *bytes != &local_bytes && *bytes != &incoming_bytes)
+                .map(|bytes| store.insert_bytes(bytes, None).map(|b| b.digest))
+                .transpose()?;
+            let reviewed = merged_bytes.is_some();
+            let customization = base_bytes.as_ref().map(|base| format!("Customizations against installed {}:\n{}\nIncoming changes conflicting with local content:\n", lock.as_ref().and_then(|l| l.pack.version_label.as_deref()).unwrap_or("baseline"), diff(&path, base, &local_bytes))).unwrap_or_else(|| "Original baseline bytes are unavailable; compare local and incoming content:\n".into());
             out.push(Conflict {
-                diff: diff(&path, &local_bytes, &incoming_bytes),
+                diff: format!(
+                    "{customization}{}",
+                    diff(&path, &local_bytes, &incoming_bytes)
+                ),
                 choice: Choice {
                     path,
                     local,
                     incoming,
-                    keep: true,
+                    keep,
+                    merged,
                 },
-                reviewed: false,
+                reviewed,
+                removed: false,
             });
         }
     }
@@ -175,6 +250,7 @@ pub fn conflicts(root: &Path, cache: &Path) -> Result<Vec<Conflict>> {
             local: digest(&local_bytes),
             incoming: digest(content.as_bytes()),
             keep: true,
+            merged: None,
         };
         let lock = crate::read_lockfile(root)?;
         if choice.local == choice.incoming
@@ -191,6 +267,7 @@ pub fn conflicts(root: &Path, cache: &Path) -> Result<Vec<Conflict>> {
             choice,
             diff: diff(&path, &local_bytes, content.as_bytes()),
             reviewed,
+            removed: false,
         });
     }
     Ok(out)
@@ -208,7 +285,8 @@ pub fn save(root: &Path, cache: &Path, choices: Vec<Choice>) -> Result<()> {
                 .iter()
                 .filter(|c| c.path == conflict.choice.path
                     && c.local == conflict.choice.local
-                    && c.incoming == conflict.choice.incoming)
+                    && c.incoming == conflict.choice.incoming
+                    && c.merged == conflict.choice.merged)
                 .count()
                 == 1,
             "file changed during review: {}",
@@ -242,7 +320,8 @@ pub fn validate(root: &Path, cache: &Path) -> Result<()> {
                 .iter()
                 .any(|c| c.path == conflict.choice.path
                     && c.local == conflict.choice.local
-                    && c.incoming == conflict.choice.incoming),
+                    && c.incoming == conflict.choice.incoming
+                    && c.merged == conflict.choice.merged),
             "file changed after review: {}",
             conflict.choice.path
         );
@@ -260,6 +339,14 @@ pub fn resolve(
             !matches!(decision, Decision::Reject { .. }),
             "update rejected at {path}"
         );
+        if matches!(decision, Decision::Untrack { .. }) {
+            if let Some(choice) = prepared.choices.iter().find(|c| c.path == *path && !c.keep) {
+                *decision = Decision::Remove {
+                    was: choice.local.clone(),
+                };
+                continue;
+            }
+        }
         if let Decision::Conflict {
             desired: Some(incoming),
             on_disk: Some(local),
@@ -280,7 +367,7 @@ pub fn resolve(
             } else {
                 Decision::Replace {
                     from: local.clone(),
-                    to: incoming.clone(),
+                    to: choice.merged.clone().unwrap_or_else(|| incoming.clone()),
                 }
             };
         }
@@ -307,14 +394,19 @@ pub fn record_choices(prepared: &PreparedInstall, next: &mut Lockfile) {
                 "reviewed_launcher".into(),
                 serde_json::to_value(choice).expect("serializable choice"),
             );
-        } else if choice.keep {
+        } else if choice.keep || choice.merged.is_some() {
             if let Some(entry) = prepared.entries.get(&choice.path) {
                 let mut entry = entry.clone();
                 entry.state = previous
                     .as_ref()
                     .and_then(|l| l.file(&choice.path))
                     .map_or(hopper_core::model::FileState::Adopted, |f| f.state);
-                entry.user_modified = Some(choice.local.clone());
+                entry.user_modified = Some(
+                    choice
+                        .merged
+                        .clone()
+                        .unwrap_or_else(|| choice.local.clone()),
+                );
                 next.files.retain(|f| f.path != choice.path);
                 next.files.push(entry);
             }

@@ -16,7 +16,7 @@ use crate::{
     migration, prompt,
 };
 
-const EXCLUDED: &[&str] = &["backups", "server/.hopper/prepared.json"];
+const EXCLUDED: &[&str] = &["backups", "update-work", "server/.hopper/prepared.json"];
 pub fn default_keep() -> usize {
     2
 }
@@ -128,7 +128,7 @@ fn move_durable(from: &Path, to: &Path) -> Result<()> {
 }
 
 /// Only used for private backup/work directories; never follows symlinks.
-fn remove_tree(path: &Path) -> Result<()> {
+pub(crate) fn remove_tree(path: &Path) -> Result<()> {
     let meta = fs::symlink_metadata(path)?;
     if meta.file_type().is_dir() {
         fs::set_permissions(
@@ -164,7 +164,14 @@ fn preflight(record: &Instance) -> Result<()> {
         .as_ref()
         .map(|s| s.entries.values().map(|f| f.size).sum::<u64>())
         .unwrap_or(0);
-    let required = required(record)?.saturating_mul(2).saturating_add(growth);
+    let copies = if staged.as_ref().is_some_and(|s| s.clean_room) {
+        3
+    } else {
+        2
+    };
+    let required = required(record)?
+        .saturating_mul(copies)
+        .saturating_add(growth);
     ensure!(
         migration::available_bytes(&record.root)? >= required,
         "insufficient free space for backup, staged files and restore (need {required} bytes free)"
@@ -393,6 +400,10 @@ pub fn worker(record: &Instance, operation: &str, args: &[String], cache: &Path)
             "{}",
             serde_json::to_string(&crate::review::conflicts(&record.server(), cache)?)?
         ),
+        "stage-audit" => println!(
+            "{}",
+            serde_json::to_string(&crate::clean_update::audit(&record.server())?)?
+        ),
         "stage-choices" => crate::review::save(
             &record.server(),
             cache,
@@ -427,6 +438,16 @@ pub fn worker(record: &Instance, operation: &str, args: &[String], cache: &Path)
 pub fn review(record: &Instance) -> Result<bool> {
     let conflicts: Vec<crate::review::Conflict> =
         serde_json::from_str(&managed::capture(record, "stage-conflicts")?)?;
+    if !prompt::json_output() {
+        let merged = conflicts
+            .iter()
+            .filter(|c| c.reviewed && c.choice.merged.is_some())
+            .count();
+        let unresolved = conflicts.iter().filter(|c| !c.reviewed).count();
+        println!(
+            "Customization review: {merged} automatically merged, {unresolved} need a decision"
+        );
+    }
     if conflicts.iter().any(|c| !c.reviewed) && (!prompt::enabled() || prompt::assume_defaults()) {
         for c in conflicts.iter().filter(|c| !c.reviewed) {
             eprintln!("Unresolved conflict: {}", c.choice.path);
@@ -445,7 +466,14 @@ pub fn review(record: &Instance) -> Result<bool> {
                 "File conflict",
                 &[
                     prompt::Item::new("Keep local", true),
-                    prompt::Item::new("Use incoming", false),
+                    prompt::Item::new(
+                        if conflict.removed {
+                            "Remove file"
+                        } else {
+                            "Use incoming"
+                        },
+                        false,
+                    ),
                 ],
                 Some(0),
             )?;

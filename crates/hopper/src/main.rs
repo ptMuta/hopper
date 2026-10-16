@@ -20,6 +20,7 @@ use hopper_core::source::resolve::{Override, resolve_for_server};
 use hopper_core::source::{SourceSpec, spec::SpecError};
 
 mod chat;
+mod clean_update;
 mod cli;
 mod curseforge;
 mod discover;
@@ -32,6 +33,7 @@ mod interface;
 #[cfg(test)]
 mod maintenance_test;
 mod managed;
+mod merge;
 mod migration;
 mod network;
 mod prompt;
@@ -746,7 +748,15 @@ async fn finish_install(
     let user_files = count_user_files(root, &existing);
 
     if !cli.global.quiet {
-        print!("{}", render::plan(&decisions, &summary, user_files));
+        if cli.install.managed_launcher && (cli.install.stage_only || cli.install.pack_changes_only)
+        {
+            println!(
+                "Pack changes: {} added, {} updated, {} removed; customizations reviewed separately",
+                summary.added, summary.upgraded, summary.removed
+            );
+        } else {
+            print!("{}", render::plan(&decisions, &summary, user_files));
+        }
         if let Some(w) = render::removal_warning(&summary) {
             print!("{w}");
         }
@@ -923,12 +933,16 @@ async fn finish_install(
             previous: existing.map(|l| l.to_json()).transpose()?,
             committed: None,
             choices: Vec::new(),
+            clean_room: cli.install.managed_launcher,
         };
         hfs::write_atomic(
             &root.join(".hopper/prepared.json"),
             &serde_json::to_vec(&prepared)?,
             false,
         )?;
+        if cli.install.managed_launcher {
+            clean_update::prepare(root, &store)?;
+        }
         return Ok(exit::CHANGES_PENDING);
     }
     let txn = format!("{}", std::process::id());
@@ -1020,6 +1034,8 @@ struct PreparedInstall {
     committed: Option<String>,
     #[serde(default)]
     choices: Vec<review::Choice>,
+    #[serde(default)]
+    clean_room: bool,
 }
 
 /// Apply the staged snapshot without a second network resolution. Reconcile after
@@ -1027,6 +1043,9 @@ struct PreparedInstall {
 fn apply_prepared(root: &Path, cache: &Path) -> Result<i32> {
     let mut prepared: PreparedInstall =
         serde_json::from_slice(&std::fs::read(root.join(".hopper/prepared.json"))?)?;
+    if prepared.clean_room {
+        return clean_update::apply(root, cache, &prepared);
+    }
     let mut previous = read_lockfile(root)?;
     let current = previous.as_ref().map(|l| l.to_json()).transpose()?;
     let already_committed = prepared.committed.is_some() && current == prepared.committed;
@@ -1036,7 +1055,7 @@ fn apply_prepared(root: &Path, cache: &Path) -> Result<i32> {
             let expected = if choice.keep {
                 &choice.local
             } else {
-                &choice.incoming
+                choice.merged.as_ref().unwrap_or(&choice.incoming)
             };
             anyhow::ensure!(
                 actual == *expected
@@ -2048,6 +2067,7 @@ mod tests {
             previous: Some(old.to_json().unwrap()),
             committed: committed.then(|| next.to_json().unwrap()),
             choices: Vec::new(),
+            clean_room: false,
         };
         let current_script = if edited {
             "#!/bin/sh\n# operator edit\nexec true\n"

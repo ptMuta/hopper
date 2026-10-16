@@ -1207,6 +1207,11 @@ pub fn maintain(
         "maintenance refused: unresolved conflicts or incomplete recovery; service untouched"
     );
     if changed {
+        let audit: crate::clean_update::Audit =
+            serde_json::from_str(&capture(record, "stage-audit")?)?;
+        if !crate::prompt::json_output() {
+            audit.report();
+        }
         let code = invoke(record, "stage", &[])?;
         ensure!(
             code == 0 || code == 10,

@@ -169,17 +169,34 @@ Operations are serialized per instance.
 
 ## Automatic update backups and revert
 
-Every changed `hopper update NAME`, including scheduled updates, saves a verified
-whole-instance backup **after graceful shutdown and before applying files**. It includes
+Every changed `hopper update NAME`, including scheduled updates, first compares current
+files to the installed version's baseline and reports local modifications and deletions.
+It stages the new release in a clean `update-work/new/` directory beside `server/`, with
+no world data copied while the server is running. Untouched baseline files adopt the new
+release automatically, including vanilla files adopted during onboarding.
+
+Text customizations are merged against the original baseline and incoming defaults.
+Non-overlapping edits merge automatically. Only unresolved customizations prompt for a
+decision, showing the admin's changes against the installed baseline. If upstream removed
+a customized file, choose whether to retain it or remove it. Binary conflicts and missing
+baseline content require review; unchanged files never prompt merely because upstream
+changed them. Custom additions and intentional deletions are preserved.
+
+After review, Hopper saves a verified whole-instance backup **after graceful shutdown
+and before applying files**. It includes
 all world directories and dimensions, configs, mods, access lists, launcher, Hopper lock
 and managed Java runtimes. The archive is private and stored under the instance's
 `backups/` directory, outside `server/`. Staging files and the backup store itself are
-excluded. Onboarding backups are separate and are never pruned by update retention.
+excluded, as is the temporary clean-room workspace. Onboarding backups are separate and
+are never pruned by update retention. Once stopped, Hopper carries the world, dimensions,
+`server.properties`, access lists, JVM settings and resolved customizations into the new
+installation, writes its new baseline ledger, and swaps directories. The old temporary
+directory is removed; the verified rolling backup remains available for recovery.
 
 Hopper keeps the latest **two** verified update backups by default. A new archive must
 pass manifest, hash, permission and gzip verification before old backups are pruned.
 Rotation temporarily needs room for a third archive, and preflight reserves space for
-backup and restoration. A failed or changed backup aborts the update. Checks with no
+backup, clean-room world copying and restoration. A failed or changed backup aborts the update. Checks with no
 pack changes and restart-only jobs do not create backups.
 
 ```sh
@@ -192,9 +209,10 @@ hopper revert horizons
 hopper revert horizons --backup update-1790000000000000000
 ```
 
-Interactive updates show a diff for each locally edited file changed upstream and ask
-whether to keep local or use incoming, defaulting to local. Binary files show hashes and
-sizes. Previously acknowledged edits are reviewed again when upstream changes. Choices
+Interactive updates ask whether to keep local or use incoming only for customizations
+that cannot be merged automatically, defaulting to local. Binary files show hashes and
+sizes. Previously acknowledged edits are compared to the current baseline, so earlier
+upstream changes do not become new admin edits. Choices
 are bound to file hashes and rechecked after shutdown. Accepted choices do not create
 `.new` sidecars. Scheduled updates, `--yes`, `--no-input`, and `--json` skip the whole
 update when a conflict needs review (exit 10), leaving the existing service untouched.

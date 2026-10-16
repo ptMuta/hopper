@@ -178,6 +178,7 @@ impl Fake {
                     previous: Some(previous.to_json()?),
                     committed: None,
                     choices: Vec::new(),
+                    clean_room: false,
                 };
                 hopper_core::fs::write_private_atomic(
                     &record.server().join(".hopper/prepared.json"),
@@ -208,6 +209,9 @@ impl Fake {
     pub fn capture(&self, record: &Instance, operation: &str, args: &[String]) -> Result<String> {
         self.event(operation);
         match operation {
+            "stage-audit" => Ok(serde_json::to_string(&crate::clean_update::audit(
+                &record.server(),
+            )?)?),
             "stage-conflicts" => Ok(serde_json::to_string(&crate::review::conflicts(
                 &record.server(),
                 &record.cache()?,
@@ -234,7 +238,87 @@ struct Fixture {
     record: Instance,
 }
 
+type UpdateFile<'a> = (
+    &'a str,
+    &'a [u8],
+    Option<&'a [u8]>,
+    Option<&'a [u8]>,
+    hopper_core::model::FileState,
+);
+
 impl Fixture {
+    fn clean_target(&self, files: &[UpdateFile<'_>]) {
+        use hopper_core::{
+            cache::BlobStore,
+            model::{LockedFile, Managed, OverrideLayer, Provenance, RelPath},
+        };
+        let store = BlobStore::new(self.record.cache().unwrap());
+        let mut old = crate::read_lockfile(&self.record.server())
+            .unwrap()
+            .unwrap();
+        old.files.clear();
+        let mut entries = std::collections::BTreeMap::new();
+        for (name, base, local, incoming, state) in files {
+            let blob = store.insert_bytes(base, None).unwrap();
+            let path = RelPath::parse(name).unwrap();
+            let file = LockedFile {
+                path: path.clone(),
+                digest: blob.digest,
+                size: blob.size,
+                state: *state,
+                provenance: Provenance::Override {
+                    layer: OverrideLayer::Server,
+                },
+                managed: Managed::Full,
+                executable: false,
+                user_modified: None,
+                disabled: false,
+                mtime_ns: None,
+            };
+            old.files.push(file.clone());
+            if let Some(local) = local {
+                let target = path.resolve_under(&self.record.server());
+                fs::create_dir_all(target.parent().unwrap()).unwrap();
+                fs::write(target, local).unwrap();
+            }
+            if let Some(incoming) = incoming {
+                let blob = store.insert_bytes(incoming, None).unwrap();
+                let mut wanted = file;
+                wanted.digest = blob.digest;
+                wanted.size = blob.size;
+                entries.insert(path, wanted);
+            }
+        }
+        old.server.start_script = Some(store.insert_bytes(b"old launcher", None).unwrap().digest);
+        hopper_core::fs::write_private_atomic(
+            &self.record.server().join(".hopper/lock.json"),
+            old.to_json().unwrap().as_bytes(),
+        )
+        .unwrap();
+        let mut template = old.clone();
+        template.pack.version_label = Some("2.9.0-RC-2".into());
+        let launcher = store.insert_bytes(b"new launcher", None).unwrap();
+        let prepared = crate::PreparedInstall {
+            template,
+            entries,
+            start: Some(crate::StartScript::Write {
+                content: "new launcher".into(),
+                digest: launcher.digest,
+            }),
+            managed: true,
+            gtnh: true,
+            previous: Some(old.to_json().unwrap()),
+            committed: None,
+            choices: Vec::new(),
+            clean_room: true,
+        };
+        hopper_core::fs::write_private_atomic(
+            &self.record.server().join(".hopper/prepared.json"),
+            &serde_json::to_vec(&prepared).unwrap(),
+        )
+        .unwrap();
+        crate::clean_update::prepare(&self.record.server(), &store).unwrap();
+    }
     fn new(running: bool) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let fake = Rc::new(Fake {
@@ -845,4 +929,260 @@ fn edited_file_after_review_invalidates_the_staged_choices() {
     .unwrap();
     assert!(crate::review::validate(&f.record.server(), &f.record.cache().unwrap()).is_err());
     assert!(crate::apply_prepared(&f.record.server(), &f.record.cache().unwrap()).is_err());
+}
+
+#[test]
+fn large_adopted_pack_update_prompts_only_for_the_customized_conflict() {
+    use hopper_core::model::FileState::*;
+    let f = Fixture::new(false);
+    let names: Vec<_> = (0..200)
+        .map(|n| format!("config/default-{n}.cfg"))
+        .collect();
+    let mut files: Vec<UpdateFile<'_>> = names
+        .iter()
+        .map(|name| {
+            (
+                name.as_str(),
+                b"old default\n".as_slice(),
+                Some(b"old default\n".as_slice()),
+                Some(b"new default\n".as_slice()),
+                Adopted,
+            )
+        })
+        .collect();
+    files.push((
+        "config/custom.cfg",
+        b"setting=base\n",
+        Some(b"setting=admin\n"),
+        Some(b"setting=upstream\n"),
+        Managed,
+    ));
+    f.clean_target(&files);
+    let conflicts =
+        crate::review::conflicts(&f.record.server(), &f.record.cache().unwrap()).unwrap();
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].choice.path.as_str(), "config/custom.cfg");
+    assert!(!conflicts[0].reviewed);
+    assert!(conflicts[0].diff.contains("-setting=base"));
+    assert!(conflicts[0].diff.contains("+setting=admin"));
+    assert_eq!(
+        fs::read(f.record.server().join("config/default-0.cfg")).unwrap(),
+        b"old default\n"
+    );
+    assert!(!f.record.root.join("update-work/new/custom-world").exists());
+}
+
+#[test]
+fn clean_room_merges_customizations_and_carries_world_properties_and_custom_mods() {
+    use hopper_core::model::FileState::*;
+    let f = Fixture::new(false);
+    fs::create_dir_all(f.record.server().join("mods")).unwrap();
+    fs::write(
+        f.record.server().join("mods/admin-extra.jar"),
+        b"custom mod",
+    )
+    .unwrap();
+    let props = fs::read(f.record.server().join("server.properties")).unwrap();
+    f.clean_target(&[
+        (
+            "config/edited.cfg",
+            b"a=1\nb=1\nc=1\n",
+            Some(b"a=2\nb=1\nc=1\n"),
+            Some(b"a=1\nb=1\nc=3\n"),
+            Managed,
+        ),
+        (
+            "mods/obsolete.jar",
+            b"old mod",
+            Some(b"old mod"),
+            None,
+            Adopted,
+        ),
+        (
+            "config/deleted.cfg",
+            b"disabled config",
+            None,
+            Some(b"new defaults"),
+            Managed,
+        ),
+        (
+            "config/vanilla.cfg",
+            b"base\n",
+            Some(b"base\n"),
+            Some(b"new defaults\n"),
+            Adopted,
+        ),
+    ]);
+    assert!(
+        recovery::review(&f.record).unwrap(),
+        "non-overlapping edits must not need a prompt"
+    );
+    let mut record = f.load();
+    recovery::begin(&mut record, false, None).unwrap();
+    let path = record.server().join(".hopper/prepared.json");
+    let prepared: crate::PreparedInstall =
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    crate::clean_update::apply(&record.server(), &record.cache().unwrap(), &prepared).unwrap();
+    assert_eq!(
+        fs::read(record.server().join("config/edited.cfg")).unwrap(),
+        b"a=2\nb=1\nc=3\n"
+    );
+    assert_eq!(
+        fs::read(record.server().join("config/vanilla.cfg")).unwrap(),
+        b"new defaults\n"
+    );
+    assert!(!record.server().join("mods/obsolete.jar").exists());
+    assert!(!record.server().join("config/deleted.cfg").exists());
+    assert_eq!(
+        fs::read(record.server().join("mods/admin-extra.jar")).unwrap(),
+        b"custom mod"
+    );
+    assert_eq!(
+        fs::read(record.server().join("server.properties")).unwrap(),
+        props
+    );
+    assert_eq!(f.world(), b"original world");
+    assert_eq!(
+        fs::read(record.server().join(".hopper-launch.sh")).unwrap(),
+        b"new launcher"
+    );
+    let lock = crate::read_lockfile(&record.server()).unwrap().unwrap();
+    let edited = lock
+        .files
+        .iter()
+        .find(|f| f.path.as_str() == "config/edited.cfg")
+        .unwrap();
+    assert!(edited.user_modified.is_some());
+    assert_ne!(edited.user_modified.as_ref(), Some(&edited.digest));
+    assert!(!record.root.join("update-work/previous").exists());
+    let id = record.backups[0].id.clone();
+    recovery::rollback(&mut record, &id, false).unwrap();
+    assert_eq!(
+        fs::read(record.server().join("config/edited.cfg")).unwrap(),
+        b"a=2\nb=1\nc=1\n"
+    );
+    assert_eq!(f.world(), b"original world");
+}
+
+#[test]
+fn interrupted_clean_room_swap_recovers_from_backup_without_a_live_server_directory() {
+    let f = Fixture::new(false);
+    f.clean_target(&[]);
+    assert!(recovery::review(&f.record).unwrap());
+    let mut record = f.load();
+    recovery::begin(&mut record, false, None).unwrap();
+    fs::rename(record.server(), record.root.join("update-work/previous")).unwrap();
+    assert!(!record.server().exists());
+    recovery::repair(&mut record).unwrap();
+    assert_eq!(f.world(), b"original world");
+    assert!(record.maintenance.is_none());
+    assert!(!record.root.join("update-work").exists());
+}
+
+#[test]
+fn clean_room_tampering_is_rejected_before_touching_the_current_installation() {
+    use hopper_core::model::FileState::Managed;
+    let f = Fixture::new(false);
+    f.clean_target(&[("config/a.cfg", b"old", Some(b"old"), Some(b"new"), Managed)]);
+    assert!(recovery::review(&f.record).unwrap());
+    let path = f.record.server().join(".hopper/prepared.json");
+    let prepared: crate::PreparedInstall =
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    fs::write(
+        f.record.root.join("update-work/new/config/a.cfg"),
+        b"tampered",
+    )
+    .unwrap();
+    assert!(
+        crate::clean_update::apply(&f.record.server(), &f.record.cache().unwrap(), &prepared)
+            .is_err()
+    );
+    assert_eq!(
+        fs::read(f.record.server().join("config/a.cfg")).unwrap(),
+        b"old"
+    );
+    assert_eq!(f.world(), b"original world");
+}
+
+#[test]
+fn removed_custom_file_requires_an_explicit_keep_or_remove_choice() {
+    for keep in [true, false] {
+        let f = Fixture::new(false);
+        f.clean_target(&[(
+            "mods/patched.jar",
+            b"baseline mod",
+            Some(b"admin patched mod"),
+            None,
+            hopper_core::model::FileState::Managed,
+        )]);
+        let mut conflicts =
+            crate::review::conflicts(&f.record.server(), &f.record.cache().unwrap()).unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert!(conflicts[0].removed);
+        conflicts[0].choice.keep = keep;
+        crate::review::save(
+            &f.record.server(),
+            &f.record.cache().unwrap(),
+            vec![conflicts.remove(0).choice],
+        )
+        .unwrap();
+        let prepared: crate::PreparedInstall = serde_json::from_slice(
+            &fs::read(f.record.server().join(".hopper/prepared.json")).unwrap(),
+        )
+        .unwrap();
+        crate::clean_update::apply(&f.record.server(), &f.record.cache().unwrap(), &prepared)
+            .unwrap();
+        assert_eq!(f.record.server().join("mods/patched.jar").exists(), keep);
+    }
+}
+
+#[test]
+fn successive_merges_use_the_new_upstream_baseline_instead_of_previous_admin_edits() {
+    use hopper_core::cache::BlobStore;
+    let f = Fixture::new(false);
+    f.clean_target(&[(
+        "config/edit.cfg",
+        b"a=1\nb=1\nc=1\n",
+        Some(b"a=2\nb=1\nc=1\n"),
+        Some(b"a=1\nb=1\nc=3\n"),
+        hopper_core::model::FileState::Managed,
+    )]);
+    assert!(recovery::review(&f.record).unwrap());
+    let path = f.record.server().join(".hopper/prepared.json");
+    let prepared: crate::PreparedInstall =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    crate::clean_update::apply(&f.record.server(), &f.record.cache().unwrap(), &prepared).unwrap();
+    let old = crate::read_lockfile(&f.record.server()).unwrap().unwrap();
+    let store = BlobStore::new(f.record.cache().unwrap());
+    assert_eq!(
+        fs::read(
+            store
+                .get_verified(&old.files[0].digest)
+                .unwrap()
+                .unwrap()
+                .path
+        )
+        .unwrap(),
+        b"a=1\nb=1\nc=3\n"
+    );
+    let mut next = prepared;
+    next.previous = Some(old.to_json().unwrap());
+    next.template = old.clone();
+    next.template.pack.version_label = Some("2.9.0-RC-3".into());
+    next.choices.clear();
+    let blob = store.insert_bytes(b"a=1\nb=4\nc=3\n", None).unwrap();
+    let file = next.entries.values_mut().next().unwrap();
+    file.digest = blob.digest;
+    file.size = blob.size;
+    hopper_core::fs::write_private_atomic(&path, &serde_json::to_vec(&next).unwrap()).unwrap();
+    crate::clean_update::prepare(&f.record.server(), &store).unwrap();
+    let conflicts =
+        crate::review::conflicts(&f.record.server(), &f.record.cache().unwrap()).unwrap();
+    assert_eq!(conflicts.len(), 1);
+    assert!(conflicts[0].reviewed);
+    let merged = conflicts[0].choice.merged.as_ref().unwrap();
+    assert_eq!(
+        fs::read(store.get_verified(merged).unwrap().unwrap().path).unwrap(),
+        b"a=2\nb=4\nc=3\n"
+    );
 }
